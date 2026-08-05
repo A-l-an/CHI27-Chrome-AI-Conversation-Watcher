@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CHI27 AI Conversation Watcher 设置</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main>
+      <h1>CHI27 AI Conversation Watcher</h1>
+      <p class="warning">
+        ActivityWatch 只保存不含正文的行为事件与去标识对话键，不保存完整 URL、消息正文、
+        按键内容、页面标题、Cookie 或 Token。后台回答通知会临时携带回答开头最多 150 个
+        字符，并在约 20 秒后由扩展清除；macOS 横幅可能只显示其中一部分。该片段可能出现
+        在锁屏或通知中心，但不会写入 ActivityWatch 或研究导出。
+      </p>
+      <section class="participant-card" aria-labelledby="participant-heading">
+        <h2 id="participant-heading">当前参与者编号</h2>
+        <p id="participant-id">正在读取…</p>
+        <p id="participant-config-note"></p>
+      </section>
+      <form id="settings">
+        <label>
+          ActivityWatch 地址
+          <input id="aw-base-url" type="url" required value="http://127.0.0.1:5600">
+        </label>
+        <label>
+          对话事件 bucket ID
+          <input id="bucket-id" type="text" required value="aw-watcher-ai-conversations">
+        </label>
+        <label>
+          实验会话 marker bucket ID
+          <input id="session-bucket-id" type="text" required value="aw-watcher-study-sessions">
+        </label>
+        <label class="checkbox">
+          <input id="notifications-enabled" type="checkbox" checked>
+          回答在后台完成时显示本扩展通知（回答开头最多 150 个字符，约 20 秒后清除）
+        </label>
+        <div class="actions">
+          <button type="submit">保存</button>
+          <button id="test-connection" type="button">测试 ActivityWatch</button>
+        </div>
+      </form>
+      <section class="participant-card" aria-labelledby="private-cues-heading">
+        <h2 id="private-cues-heading">保存给回溯工具</h2>
+        <p>
+          仅在本次实验已正常结束后可以保存。生成的 JSON 文件只包含回答完成事件的
+          匿名链接、短线索和时间；不包含参与者编号、回答预览、完整 URL 或原始事件 ID。
+          已取消的实验不能保存。
+        </p>
+        <button id="export-private-cues" type="button">保存给回溯工具…（JSON）</button>
+      </section>
+      <p id="status" role="status" aria-live="polite"></p>
+    </main>
+    <script src="participant_config.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

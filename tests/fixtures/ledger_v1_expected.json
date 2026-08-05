@@ -1,0 +1,13 @@
+{
+  "source_event_count": 17,
+  "safe_event_count": 17,
+  "visit_count": 3,
+  "turn_count": 2,
+  "returned_count": 1,
+  "interacted_count": 1,
+  "engaged_count": 1,
+  "conversation_visit_counts": {
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": 2,
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": 1
+  }
+}

@@ -1,0 +1,13 @@
+.DS_Store
+Thumbs.db
+dist/
+node_modules/
+participant_config.json
+*.log
+*.zip
+*.sha256
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example

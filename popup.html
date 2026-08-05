@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CHI27 实验会话</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <h1>CHI27 实验会话</h1>
+      <div class="participant-card">
+        <span>参与者编号</span>
+        <strong id="participant-id">正在读取…</strong>
+        <small id="participant-config-note"></small>
+      </div>
+      <p id="session-status" class="status" role="status" aria-live="polite">
+        正在读取状态…
+      </p>
+      <dl>
+        <div>
+          <dt>开始时间</dt>
+          <dd id="start-time">—</dd>
+        </div>
+        <div>
+          <dt>持续时间</dt>
+          <dd id="elapsed-time">—</dd>
+        </div>
+        <div>
+          <dt>同步状态</dt>
+          <dd id="sync-status">—</dd>
+        </div>
+      </dl>
+      <div class="actions">
+        <button id="start-session" type="button">开始本次实验</button>
+        <button id="stop-session" type="button">结束本次实验</button>
+        <button id="cancel-session" class="secondary" type="button">
+          取消并标记无效
+        </button>
+      </div>
+      <p id="error" class="error" role="alert"></p>
+    </main>
+    <script src="participant_config.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

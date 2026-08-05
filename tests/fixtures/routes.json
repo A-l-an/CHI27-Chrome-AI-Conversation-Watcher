@@ -1,0 +1,22 @@
+[
+  {
+    "provider": "chatgpt",
+    "url": "https://chatgpt.com/c/chat_fixture_123?model=test#section",
+    "provider_conversation_id": "chat_fixture_123"
+  },
+  {
+    "provider": "claude",
+    "url": "https://claude.ai/chat/123e4567-e89b-12d3-a456-426614174000",
+    "provider_conversation_id": "123e4567-e89b-12d3-a456-426614174000"
+  },
+  {
+    "provider": "chatgpt",
+    "url": "https://chatgpt.com/",
+    "provider_conversation_id": null
+  },
+  {
+    "provider": "claude",
+    "url": "https://claude.ai/new",
+    "provider_conversation_id": null
+  }
+]

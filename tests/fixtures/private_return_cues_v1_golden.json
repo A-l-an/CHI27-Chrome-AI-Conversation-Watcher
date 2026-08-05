@@ -1,0 +1,164 @@
+{
+  "schema_version": "chi27-rta-private-return-cues-golden/1.0",
+  "closed_schema_contract": {
+    "top_level_fields": [
+      "schema_version",
+      "artifact_class",
+      "study_session_id",
+      "created_at_utc",
+      "records"
+    ],
+    "schema_version": "chi27-rta-private-return-cues/1.0",
+    "artifact_class": "local_content_derived_private",
+    "record_fields": [
+      "event_link_id",
+      "provider",
+      "completion_time",
+      "label",
+      "generator",
+      "version",
+      "status",
+      "expires_at_utc"
+    ],
+    "providers": ["chatgpt", "claude"],
+    "generator": "deterministic_response_preview_v1",
+    "version": "1.0",
+    "statuses": [
+      "generated",
+      "sensitive_pattern_blocked",
+      "low_information"
+    ]
+  },
+  "event_link_vectors": [
+    {
+      "raw_completion_id": "00000000-0000-4000-8000-000000000321",
+      "event_link_id": "evt_4a66f48c4bb0def380ea"
+    },
+    {
+      "raw_completion_id": "123e4567-e89b-42d3-a456-426614174000",
+      "event_link_id": "evt_320159ebe3219112484b"
+    }
+  ],
+  "sidecar_example": {
+    "schema_version": "chi27-rta-private-return-cues/1.0",
+    "artifact_class": "local_content_derived_private",
+    "study_session_id": "11111111-1111-4111-8111-111111111111",
+    "created_at_utc": "2026-07-30T00:00:03.000Z",
+    "records": [
+      {
+        "event_link_id": "evt_4a66f48c4bb0def380ea",
+        "provider": "chatgpt",
+        "completion_time": "2026-07-30T00:00:02.000Z",
+        "label": "注意力切换可分为三个阶段",
+        "generator": "deterministic_response_preview_v1",
+        "version": "1.0",
+        "status": "generated",
+        "expires_at_utc": "2026-08-06T00:00:02.000Z"
+      }
+    ]
+  },
+  "label_vectors": [
+    {
+      "name": "chinese_common_openings",
+      "input": "当然，以下是结果：注意力切换可分为三个阶段。",
+      "status": "generated",
+      "label": "注意力切换可分为三个阶段"
+    },
+    {
+      "name": "english_common_opening_and_truncation",
+      "input": "Sure. Attention shifts have three phases.",
+      "status": "generated",
+      "label": "Attention shifts have"
+    },
+    {
+      "name": "markdown_wrapper",
+      "input": "**Use interval playback** before deciding.",
+      "status": "generated",
+      "label": "Use interval playback"
+    },
+    {
+      "name": "code_fence_wrapper",
+      "input": "```text\nTask switching has costs.\n```",
+      "status": "generated",
+      "label": "Task switching has costs"
+    },
+    {
+      "name": "nfkc_and_bidi_control_strip",
+      "input": "Ｓｕｒｅ。 回答已经完成‮",
+      "status": "generated",
+      "label": "回答已经完成"
+    },
+    {
+      "name": "embedded_control_strip",
+      "input": "Useful\u0000 finding",
+      "status": "generated",
+      "label": "Useful finding"
+    },
+    {
+      "name": "arabic_letter_mark_strip",
+      "input": "Useful؜ finding",
+      "status": "generated",
+      "label": "Useful finding"
+    },
+    {
+      "name": "empty",
+      "input": " \n\t ",
+      "status": "low_information",
+      "label": ""
+    },
+    {
+      "name": "generic_low_information",
+      "input": "好的。收到。",
+      "status": "low_information",
+      "label": ""
+    },
+    {
+      "name": "email_blocks_whole_record",
+      "input": "Contact person@example.invalid for details",
+      "status": "sensitive_pattern_blocked",
+      "label": ""
+    },
+    {
+      "name": "url_blocks_whole_record",
+      "input": "Open https://example.com/private now",
+      "status": "sensitive_pattern_blocked",
+      "label": ""
+    },
+    {
+      "name": "phone_blocks_whole_record",
+      "input": "Call +86 138 0013 8000 after the study",
+      "status": "sensitive_pattern_blocked",
+      "label": ""
+    },
+    {
+      "name": "path_blocks_whole_record",
+      "input": "Open /workspace/private/session.json",
+      "status": "sensitive_pattern_blocked",
+      "label": ""
+    },
+    {
+      "name": "uuid_blocks_whole_record",
+      "input": "Return 123e4567-e89b-42d3-a456-426614174000 completed",
+      "status": "sensitive_pattern_blocked",
+      "label": ""
+    },
+    {
+      "name": "handle_blocks_whole_record",
+      "input": "Ask @example_research about this",
+      "status": "sensitive_pattern_blocked",
+      "label": ""
+    },
+    {
+      "name": "token_like_blocks_whole_record",
+      "input": "Token abcdEFGH12345678ijklMNOP is active",
+      "status": "sensitive_pattern_blocked",
+      "label": ""
+    },
+    {
+      "name": "long_digits_block_whole_record",
+      "input": "Reference 2026073000012345 is ready",
+      "status": "sensitive_pattern_blocked",
+      "label": ""
+    }
+  ]
+}

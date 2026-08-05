@@ -1,0 +1,18 @@
+[
+  { "type": "START", "visible": true, "at": 0 },
+  { "type": "INPUT_CHANGED", "nonEmpty": false, "at": 100 },
+  { "type": "INPUT_CHANGED", "nonEmpty": true, "at": 200 },
+  { "type": "INPUT_CHANGED", "nonEmpty": true, "at": 300 },
+  { "type": "PROMPT_SUBMITTED", "signal": "send_control_clicked", "at": 400 },
+  { "type": "PROMPT_SUBMITTED", "signal": "composer_form_submitted", "at": 450 },
+  { "type": "RESPONSE_STARTED", "signal": "stop_control_appeared", "at": 500 },
+  { "type": "BACKGROUND", "at": 600 },
+  {
+    "type": "RESPONSE_COMPLETED",
+    "signal": "stop_control_disappeared_after_settle",
+    "at": 700
+  },
+  { "type": "FOREGROUND", "signal": "document_visibility", "at": 800 },
+  { "type": "USER_INTERACTION", "signal": "click", "at": 900 },
+  { "type": "INPUT_CHANGED", "nonEmpty": true, "at": 1000 }
+]

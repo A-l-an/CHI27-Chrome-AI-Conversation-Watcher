@@ -1,0 +1,57 @@
+{
+  "manifest_version": 3,
+  "name": "CHI27 AI Conversation Watcher",
+  "version": "0.2.8",
+  "description": "Content-free ActivityWatch events with ephemeral response previews in local tracker notifications.",
+  "permissions": [
+    "alarms",
+    "downloads",
+    "nativeMessaging",
+    "notifications",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:5600/*",
+    "http://localhost:5600/*",
+    "https://chatgpt.com/*",
+    "https://claude.ai/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "extension-assets/icon-16.png",
+    "32": "extension-assets/icon-32.png",
+    "48": "extension-assets/icon-48.png",
+    "128": "extension-assets/icon-128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://claude.ai/*"
+      ],
+      "js": [
+        "src/core.js",
+        "src/private_return_cues.js",
+        "src/identity.js",
+        "src/route_observer.js",
+        "src/state_machine.js",
+        "src/adapters/base.js",
+        "src/adapters/chatgpt.js",
+        "src/adapters/claude.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "options.html",
+  "action": {
+    "default_title": "CHI27 AI Conversation Watcher",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "extension-assets/icon-16.png",
+      "32": "extension-assets/icon-32.png"
+    }
+  }
+}
