@@ -194,10 +194,10 @@ def package(output_dir: Path) -> tuple[Path, Path, Path]:
             handle.writestr(info, (ROOT / Path(relative.as_posix())).read_bytes())
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     sidecar = output_dir / f"{stem}.sha256"
-    sidecar.write_text(f"{digest}  {archive.name}\n", encoding="utf-8", newline="\n")
+    sidecar.write_bytes(f"{digest}  {archive.name}\n".encode("utf-8"))
     provenance = json.loads((ROOT / "SOURCE_PROVENANCE.json").read_text(encoding="utf-8"))
     build_manifest = output_dir / f"{stem}.manifest.json"
-    build_manifest.write_text(
+    build_manifest.write_bytes(
         json.dumps(
             {
                 "schema_version": "1.0",
@@ -213,9 +213,7 @@ def package(output_dir: Path) -> tuple[Path, Path, Path]:
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
-        ) + "\n",
-        encoding="utf-8",
-        newline="\n",
+        ).encode("utf-8") + b"\n",
     )
     return archive, sidecar, build_manifest
 
