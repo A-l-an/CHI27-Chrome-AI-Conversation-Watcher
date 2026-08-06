@@ -173,6 +173,8 @@ function createBackgroundHarness(fetchImpl, options = {}) {
   const notificationsCreated = [];
   const notificationsCleared = [];
   const deferredWindowUpdates = [];
+  let deferredQueueMigrationRead = null;
+  let queueMigrationReadWasDeferred = false;
   const activeNotifications = new Set(options.activeNotifications || []);
   const tabsCreated = [];
   const tabsUpdated = [];
@@ -314,6 +316,15 @@ function createBackgroundHarness(fetchImpl, options = {}) {
             if (Object.hasOwn(storage, key)) {
               result[key] = clone(storage[key]);
             }
+          }
+          if (
+            options.deferQueueMigrationRead &&
+            !queueMigrationReadWasDeferred &&
+            requested.includes("legacy_reliable_event_queue_quarantine_v1")
+          ) {
+            queueMigrationReadWasDeferred = true;
+            deferredQueueMigrationRead = () => callback(result);
+            return;
           }
           callback(result);
         },
@@ -522,6 +533,18 @@ function createBackgroundHarness(fetchImpl, options = {}) {
     clock,
     consoleErrors,
     deferredWindowUpdates,
+    hasDeferredQueueMigrationRead() {
+      return typeof deferredQueueMigrationRead === "function";
+    },
+    releaseQueueMigrationRead() {
+      if (!deferredQueueMigrationRead) {
+        return false;
+      }
+      const release = deferredQueueMigrationRead;
+      deferredQueueMigrationRead = null;
+      release();
+      return true;
+    },
     fetchCalls,
     listeners,
     nativeMessages,
@@ -995,6 +1018,7 @@ function rawPromptEvent() {
   return buildActivityWatchEvent({
     provider: "chatgpt",
     event_type: "prompt_submitted",
+    turn_link_id: "10000000-0000-4000-8000-000000000001",
     source_event_id: "00000000-0000-4000-8000-000000000001",
     occurred_at: "2026-07-30T00:00:01.000Z",
     observed_at: "2026-07-30T00:00:01.010Z",
@@ -1013,7 +1037,16 @@ function rawPromptEvent() {
   });
 }
 
-function responseLifecycleEvent(request, eventType, sourceEventId) {
+function turnLinkIdForOffset(sourceOffset) {
+  return `10000000-0000-4000-8000-${String(sourceOffset).padStart(12, "0")}`;
+}
+
+function responseLifecycleEvent(
+  request,
+  eventType,
+  sourceEventId,
+  turnLinkId
+) {
   const metadataByType = {
     assistant_response_started: {
       signal: "stop_control_appeared",
@@ -1032,9 +1065,14 @@ function responseLifecycleEvent(request, eventType, sourceEventId) {
       state_transition: "responding_to_cancelled"
     }
   };
+  const numericOffset = Number.parseInt(sourceEventId.slice(-12), 10);
+  const defaultTurnOffset = Number.isFinite(numericOffset)
+    ? numericOffset - (numericOffset % 2)
+    : 0;
   return buildActivityWatchEvent({
     provider: request.provider,
     event_type: eventType,
+    turn_link_id: turnLinkId || turnLinkIdForOffset(defaultTurnOffset),
     source_event_id: sourceEventId,
     occurred_at: new Date(
       Date.parse("2026-07-30T00:00:02.000Z") +
@@ -1055,11 +1093,13 @@ async function sendResponseLifecycle(
   eventTypes,
   sourceOffset = 10
 ) {
+  const turnLinkId = turnLinkIdForOffset(sourceOffset);
   const events = eventTypes.map((eventType, index) =>
     responseLifecycleEvent(
       request,
       eventType,
-      `00000000-0000-4000-8000-${String(sourceOffset + index).padStart(12, "0")}`
+      `00000000-0000-4000-8000-${String(sourceOffset + index).padStart(12, "0")}`,
+      turnLinkId
     )
   );
   return sendRuntimeMessage(
@@ -1088,15 +1128,18 @@ async function sendPrivateResponseLifecycle(
   sourceOffset,
   label
 ) {
+  const turnLinkId = turnLinkIdForOffset(sourceOffset);
   const started = responseLifecycleEvent(
     request,
     "assistant_response_started",
-    `00000000-0000-4000-8000-${String(sourceOffset).padStart(12, "0")}`
+    `00000000-0000-4000-8000-${String(sourceOffset).padStart(12, "0")}`,
+    turnLinkId
   );
   const completed = responseLifecycleEvent(
     request,
     "assistant_response_completed",
-    `00000000-0000-4000-8000-${String(sourceOffset + 1).padStart(12, "0")}`
+    `00000000-0000-4000-8000-${String(sourceOffset + 1).padStart(12, "0")}`,
+    turnLinkId
   );
   const authorization = await sendRuntimeMessage(
     harness,
@@ -1358,6 +1401,221 @@ test("legacy scope is retained unused while raw queue and notification records a
     JSON.stringify(harness.notificationsCreated),
     new RegExp(rawIdCanary)
   );
+});
+
+test("schema v1.0 pending queue migration preserves unrecoverable lifecycle records in quarantine", async () => {
+  const legacyLifecycle = rawPromptEvent();
+  legacyLifecycle.data.schema_version = "1.0";
+  delete legacyLifecycle.data.turn_link_id;
+
+  const legacyForeground = buildActivityWatchEvent({
+    provider: "chatgpt",
+    event_type: "conversation_foregrounded",
+    source_event_id: "00000000-0000-4000-8000-000000000091",
+    occurred_at: "2026-07-30T00:00:00.500Z",
+    observed_at: "2026-07-30T00:00:00.510Z",
+    conversation: {
+      conversation_key: "a".repeat(64),
+      identity_status: "exact",
+      namespace_generation: 1,
+      namespace_fingerprint: "fixture-namespace-fingerprint"
+    },
+    confidence: "exact",
+    source_adapter: "chatgpt-dom-v1",
+    metadata: {
+      visibility: "visible",
+      state_transition: "initial_foreground"
+    }
+  });
+  legacyForeground.data.schema_version = "1.0";
+
+  const harness = createBackgroundHarness(
+    () => successfulResponse(),
+    {
+      initialStorage: {
+        reliable_event_queue_v1: {
+          acknowledged: [],
+          pending: [legacyLifecycle, legacyForeground].map((event) => ({
+            event,
+            attempts: 0,
+            next_attempt_at: 0
+          }))
+        }
+      }
+    }
+  );
+  await waitFor(
+    () => writtenEvents(harness).some(
+      (event) => event.data.event_type === "watcher_heartbeat"
+    ),
+    "startup heartbeat was not written after queue migration"
+  );
+
+  const written = writtenEvents(harness);
+  const migrated = written.find(
+    (event) => event.data.source_event_id === legacyForeground.data.source_event_id
+  );
+  assert.equal(migrated.data.schema_version, "1.1");
+  assert.equal(migrated.data.event_type, "conversation_foregrounded");
+  assert.equal(
+    written.some(
+      (event) => event.data.source_event_id === legacyLifecycle.data.source_event_id
+    ),
+    false
+  );
+
+  const quarantine = harness.storage.legacy_reliable_event_queue_quarantine_v1;
+  assert.equal(quarantine.schema_version, "1.0");
+  assert.equal(quarantine.records.length, 1);
+  assert.equal(
+    quarantine.records[0].reason_code,
+    "lifecycle_missing_turn_link"
+  );
+  assert.equal(
+    quarantine.records[0].record.event.data.source_event_id,
+    legacyLifecycle.data.source_event_id
+  );
+  assert.equal(
+    Object.hasOwn(quarantine.records[0].record.event.data, "turn_link_id"),
+    false
+  );
+
+  const diagnostics = harness.storage.background_diagnostics_v1 || [];
+  for (const code of [
+    "legacy_queue_safe_non_lifecycle_migrated",
+    "legacy_queue_lifecycle_quarantined_missing_turn_link"
+  ]) {
+    const diagnostic = diagnostics.find((item) => item.code === code);
+    assert.equal(Boolean(diagnostic), true, `${code} diagnostic is required`);
+    assert.equal(diagnostic.item_count, 1);
+  }
+  assert.equal(harness.storage.reliable_event_queue_v1.pending.length, 0);
+});
+
+test("enqueue waits for a delayed queue migration and preserves both legacy and new events", async () => {
+  const legacyForeground = buildActivityWatchEvent({
+    provider: "chatgpt",
+    event_type: "conversation_foregrounded",
+    source_event_id: "00000000-0000-4000-8000-000000000092",
+    occurred_at: "2026-07-30T00:00:00.500Z",
+    observed_at: "2026-07-30T00:00:00.510Z",
+    conversation: {
+      conversation_key: "a".repeat(64),
+      identity_status: "exact",
+      namespace_generation: 1,
+      namespace_fingerprint: "fixture-namespace-fingerprint"
+    },
+    confidence: "exact",
+    source_adapter: "chatgpt-dom-v1",
+    metadata: {
+      visibility: "visible",
+      state_transition: "initial_foreground"
+    }
+  });
+  legacyForeground.data.schema_version = "1.0";
+  const newPrompt = rawPromptEvent();
+  const harness = createBackgroundHarness(
+    () => successfulResponse(),
+    {
+      deferQueueMigrationRead: true,
+      initialStorage: {
+        reliable_event_queue_v1: {
+          acknowledged: [],
+          pending: [{
+            event: legacyForeground,
+            attempts: 0,
+            next_attempt_at: 0
+          }]
+        }
+      }
+    }
+  );
+  await waitFor(
+    () => harness.hasDeferredQueueMigrationRead(),
+    "queue migration read was not delayed"
+  );
+  harness.listeners.alarms[0]({ name: "flush-ai-conversation-events" });
+
+  let enqueueSettled = false;
+  const enqueue = sendRuntimeMessage(
+    harness,
+    { type: "ENQUEUE_EVENTS", events: [newPrompt] },
+    clone(TARGET_SENDER)
+  ).finally(() => {
+    enqueueSettled = true;
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(enqueueSettled, false);
+  assert.equal(eventWrites(harness).length, 0);
+
+  assert.equal(harness.releaseQueueMigrationRead(), true);
+  const response = await enqueue;
+  assert.equal(response.added, 1);
+  await waitFor(
+    () => writtenEvents(harness).some(
+      (event) => event.data.event_type === "watcher_heartbeat"
+    ),
+    "startup heartbeat was not written after delayed migration"
+  );
+  const writtenIds = new Set(
+    writtenEvents(harness).map((event) => event.data.source_event_id)
+  );
+  assert.equal(writtenIds.has(legacyForeground.data.source_event_id), true);
+  assert.equal(writtenIds.has(newPrompt.data.source_event_id), true);
+});
+
+test("unsafe schema v1.0 queue payload blocks migration without copying or deleting it", async () => {
+  const contentCanary = "UNSAFE_LEGACY_PROMPT_TEXT_CANARY";
+  const unsafeLegacy = rawPromptEvent();
+  unsafeLegacy.data.schema_version = "1.0";
+  delete unsafeLegacy.data.turn_link_id;
+  unsafeLegacy.data.metadata.prompt_text = contentCanary;
+  const originalQueue = {
+    acknowledged: [],
+    pending: [{
+      event: unsafeLegacy,
+      attempts: 0,
+      next_attempt_at: 0,
+      prompt_text: contentCanary
+    }]
+  };
+  const harness = createBackgroundHarness(
+    () => successfulResponse(),
+    { initialStorage: { reliable_event_queue_v1: originalQueue } }
+  );
+  await waitFor(
+    () => (harness.storage.background_diagnostics_v1 || []).some(
+      (item) => item.code === "legacy_queue_unsafe_payload_blocked"
+    ),
+    "unsafe legacy queue payload did not emit a blocking diagnostic"
+  );
+
+  assert.deepEqual(
+    harness.storage.reliable_event_queue_v1,
+    originalQueue
+  );
+  assert.equal(
+    harness.storage.legacy_reliable_event_queue_quarantine_v1,
+    undefined
+  );
+  assert.equal(eventWrites(harness).length, 0);
+  assert.doesNotMatch(
+    JSON.stringify(harness.storage.background_diagnostics_v1),
+    new RegExp(contentCanary)
+  );
+
+  const response = await sendRuntimeMessage(
+    harness,
+    { type: "ENQUEUE_EVENTS", events: [rawPromptEvent()] },
+    clone(TARGET_SENDER)
+  );
+  assert.equal(response.error, "legacy_queue_unsafe_payload_blocked");
+  assert.deepEqual(
+    harness.storage.reliable_event_queue_v1,
+    originalQueue
+  );
+  assert.equal(eventWrites(harness).length, 0);
 });
 
 test("popup session commands are idempotent and write paired start, stop, and cancel markers", async () => {
@@ -1714,7 +1972,26 @@ test("real Claude hidden-completion adapter path reaches inactive suppressed aud
     },
     reason_code: "response_completed_while_hidden"
   };
-  const state = { responseTurnCount: 1, streaming: false };
+  const state = {
+    responseTurnCount: 1,
+    streaming: false,
+    responseTurns: []
+  };
+  function responseTurns() {
+    while (state.responseTurns.length < state.responseTurnCount) {
+      state.responseTurns.push({});
+    }
+    state.responseTurns.length = state.responseTurnCount;
+    return state.responseTurns;
+  }
+  const streaming = {
+    closest(selector) {
+      const turns = responseTurns();
+      return selector === ".font-claude-response"
+        ? turns[turns.length - 1]
+        : null;
+    }
+  };
   const composerSelector =
     "div[data-testid='chat-input'][role='textbox'].tiptap.ProseMirror";
   const composer = {
@@ -1730,13 +2007,16 @@ test("real Claude hidden-completion adapter path reaches inactive suppressed aud
         return composer;
       }
       if (selector === "[data-is-streaming='true']") {
-        return state.streaming ? {} : null;
+        return state.streaming ? streaming : null;
       }
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === "[data-is-streaming='true']") {
+        return state.streaming ? [streaming] : [];
+      }
       return selector === ".font-claude-response"
-        ? Array.from({ length: state.responseTurnCount }, () => ({}))
+        ? responseTurns()
         : [];
     }
   };
@@ -1785,6 +2065,7 @@ test("real Claude hidden-completion adapter path reaches inactive suppressed aud
   const event = buildActivityWatchEvent({
     provider: "claude",
     event_type: completed.event_type,
+    turn_link_id: completed.turn_link_id,
     source_event_id: "00000000-0000-4000-8000-000000000321",
     occurred_at: occurredAt,
     observed_at: occurredAt,
@@ -3742,14 +4023,17 @@ test("private Return cue is stored only for an active bound response and exports
   assert.equal(record.label, privateLabel);
   assert.match(record.event_link_id, /^evt_[0-9a-f]{20}$/);
   const rawCompletionId = "00000000-0000-4000-8000-000000000501";
+  const rawTurnLinkId = turnLinkIdForOffset(500);
   assert.equal(
     record.event_link_id,
     `evt_${crypto.createHash("sha256").update(rawCompletionId).digest("hex").slice(0, 20)}`
   );
   const durablePrivate = JSON.stringify(state);
   assert.doesNotMatch(durablePrivate, new RegExp(rawCompletionId));
+  assert.doesNotMatch(durablePrivate, new RegExp(rawTurnLinkId));
   for (const forbiddenKey of [
     "raw_completion_id",
+    "turn_link_id",
     "response_preview",
     "notification_preview",
     "prompt",

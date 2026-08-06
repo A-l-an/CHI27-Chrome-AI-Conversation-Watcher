@@ -14,6 +14,8 @@ const {
   validateActivityWatchEvent
 } = require("../src/core.js");
 
+const TURN_LINK_ID = "00000000-0000-4000-8000-0000000000a1";
+
 test("ephemeral notification preview collapses controls and truncates by Unicode character", () => {
   assert.equal(
     sanitizeEphemeralNotificationPreview("  第一行\n\u202e第二行\t  "),
@@ -96,6 +98,7 @@ test("ActivityWatch outer event and data contract are complete and content-free"
   const event = buildActivityWatchEvent({
     provider: "chatgpt",
     event_type: "prompt_submitted",
+    turn_link_id: TURN_LINK_ID,
     occurred_at: "2026-07-23T00:00:00.000Z",
     observed_at: "2026-07-23T00:00:00.010Z",
     source_event_id: "00000000-0000-4000-8000-000000000001",
@@ -117,7 +120,8 @@ test("ActivityWatch outer event and data contract are complete and content-free"
   });
   assert.equal(event.duration, 0);
   assert.equal(event.timestamp, event.data.occurred_at);
-  assert.equal(event.data.schema_version, "1.0");
+  assert.equal(event.data.schema_version, "1.1");
+  assert.equal(event.data.turn_link_id, TURN_LINK_ID);
   assert.equal(event.data.surface, "chrome");
   assert.equal(event.data.privacy_tier, "content_free_local");
   assert.equal(event.data.metadata.signal, "send_control_clicked");
@@ -163,6 +167,7 @@ test("persisted-event sanitizer rejects raw URL or provider-ID canaries in every
   const safe = buildActivityWatchEvent({
     provider: "chatgpt",
     event_type: "prompt_submitted",
+    turn_link_id: TURN_LINK_ID,
     source_event_id: "00000000-0000-4000-8000-000000000088",
     occurred_at: "2026-07-23T00:00:00.000Z",
     observed_at: "2026-07-23T00:00:00.010Z",
@@ -198,6 +203,47 @@ test("persisted-event sanitizer rejects raw URL or provider-ID canaries in every
   unknownKey.data.metadata.raw_route =
     "https://chatgpt.com/c/raw-provider-id-canary";
   assert.equal(sanitizePersistedActivityWatchEvent(unknownKey), null);
+});
+
+test("v1.1 turn links are UUIDv4-only and absent from non-turn events", () => {
+  const turnBase = {
+    provider: "chatgpt",
+    event_type: "prompt_submitted",
+    conversation: {
+      conversation_key: "a".repeat(64),
+      identity_status: "exact",
+      namespace_generation: 1,
+      namespace_fingerprint: "fixture-namespace-fingerprint"
+    },
+    confidence: "derived",
+    source_adapter: "chatgpt-dom-v1",
+    metadata: {
+      signal: "send_control_clicked",
+      state_transition: "draft_to_submitted"
+    }
+  };
+  assert.throws(
+    () => buildActivityWatchEvent(turnBase),
+    /turn_link_id is required/
+  );
+  assert.throws(
+    () => buildActivityWatchEvent(Object.assign({}, turnBase, {
+      turn_link_id: "00000000-0000-1000-8000-0000000000a1"
+    })),
+    /turn_link_id is required/
+  );
+  const nonTurn = Object.assign({}, turnBase, {
+    event_type: "input_started",
+    turn_link_id: TURN_LINK_ID,
+    metadata: {
+      signal: "composer_empty_to_nonempty",
+      state_transition: "empty_to_nonempty"
+    }
+  });
+  assert.throws(
+    () => buildActivityWatchEvent(nonTurn),
+    /turn_link_id is forbidden/
+  );
 });
 
 test("manifest declares only the expected local ActivityWatch and provider hosts", () => {

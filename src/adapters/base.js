@@ -48,6 +48,30 @@
     return count;
   }
 
+  function queryElements(selector) {
+    const elements = [];
+    for (const candidate of selectorList(selector)) {
+      try {
+        for (const match of document.querySelectorAll(candidate)) {
+          if (match && !elements.includes(match)) {
+            elements.push(match);
+          }
+        }
+      } catch (_error) {
+        // Ignore a provider selector that the current browser cannot parse.
+      }
+      try {
+        const first = document.querySelector(candidate);
+        if (first && !elements.includes(first)) {
+          elements.unshift(first);
+        }
+      } catch (_error) {
+        // Ignore a provider selector that the current browser cannot parse.
+      }
+    }
+    return elements;
+  }
+
   function queryLast(selector) {
     for (const candidate of selectorList(selector)) {
       try {
@@ -130,11 +154,28 @@
       this.provider = config.provider;
       this.selectors = config.selectors;
       this.onAction = config.onAction;
-      this.healthGraceMs = config.healthGraceMs || 10000;
-      this.responseSignalTimeoutMs = config.responseSignalTimeoutMs || 15000;
-      this.completionSettleMs = config.completionSettleMs || 800;
-      this.responseQuietMs = config.responseQuietMs || 1500;
-      this.submissionDedupeMs = config.submissionDedupeMs || 1000;
+      this.now = typeof config.now === "function" ? config.now : Date.now;
+      this.healthGraceMs = Number.isFinite(config.healthGraceMs)
+        ? config.healthGraceMs
+        : 10000;
+      this.responseSignalTimeoutMs = Number.isFinite(config.responseSignalTimeoutMs)
+        ? config.responseSignalTimeoutMs
+        : 15000;
+      this.completionSettleMs = Number.isFinite(config.completionSettleMs)
+        ? config.completionSettleMs
+        : 800;
+      this.responseQuietMs = Number.isFinite(config.responseQuietMs)
+        ? config.responseQuietMs
+        : 1500;
+      this.submissionDedupeMs = Number.isFinite(config.submissionDedupeMs)
+        ? config.submissionDedupeMs
+        : 1000;
+      this.observationPollIntervalMs = Number.isFinite(config.observationPollIntervalMs)
+        ? config.observationPollIntervalMs
+        : 250;
+      this.observationPollWindowMs = Number.isFinite(config.observationPollWindowMs)
+        ? config.observationPollWindowMs
+        : 30000;
       this.mutationObserverOptions = Object.assign(
         { childList: true, subtree: true },
         config.mutationObserverOptions || {}
@@ -143,6 +184,8 @@
         Boolean(config.requireSubmissionForResponseSignals);
       this.requireResponseTurnForCompletion =
         Boolean(config.requireResponseTurnForCompletion);
+      this.requireActiveEdgeForCompletion =
+        Boolean(config.requireActiveEdgeForCompletion);
       this.responseIdentityAttribute =
         typeof config.responseIdentityAttribute === "string"
           ? config.responseIdentityAttribute
@@ -159,14 +202,25 @@
       this.responseObservedTurnCount = 0;
       this.lastSubmissionAt = -Infinity;
       this.submissionPending = false;
+      this.observationEpoch = 0;
+      this.activeTurnLinkId = "";
+      this.activeEdgeObserved = false;
+      this.inactiveEdgeObserved = false;
+      this.inactiveEdgeSignal = "";
+      this.responseTurnConfirmedForObservation = false;
+      this.candidateResponseTurnElement = null;
+      this.ownedActiveSignal = "";
       this.notificationPreviewCandidate = "";
       this.notificationPreviewIdentity = "";
       this.notificationPreviewSourceLength = 0;
       this.submissionResponseTurnIdentity = "";
+      this.submissionResponseTurnElement = null;
       this.completionTimer = null;
       this.responseSignalTimer = null;
       this.healthTimer = null;
       this.mutationTimer = null;
+      this.observationPollTimer = null;
+      this.observationPollDeadline = 0;
       this.unhealthyReasons = new Set();
       this.boundInput = (event) => this.handleInput(event);
       this.boundKeydown = (event) => this.handleKeydown(event);
@@ -215,17 +269,33 @@
         this.completionTimer,
         this.responseSignalTimer,
         this.healthTimer,
-        this.mutationTimer
+        this.mutationTimer,
+        this.observationPollTimer
       ]) {
         if (timer) {
           root.clearTimeout(timer);
         }
       }
+      this.observationEpoch += 1;
+      this.activeTurnLinkId = "";
+      this.responseObserved = false;
+      this.submissionPending = false;
+      this.completionTimer = null;
+      this.responseSignalTimer = null;
+      this.healthTimer = null;
+      this.mutationTimer = null;
+      this.observationPollTimer = null;
+      this.observationPollDeadline = 0;
+      this.candidateResponseTurnElement = null;
+      this.ownedActiveSignal = "";
     }
 
     resetConversation() {
+      this.observationEpoch += 1;
+      this.activeTurnLinkId = "";
       this.responseObserved = false;
       this.clearCompletionTimer();
+      this.clearObservationPolling();
       if (this.responseSignalTimer) {
         root.clearTimeout(this.responseSignalTimer);
         this.responseSignalTimer = null;
@@ -235,6 +305,12 @@
       this.responseObservedTurnCount = this.lastSnapshot.responseTurnCount;
       this.lastSubmissionAt = -Infinity;
       this.submissionPending = false;
+      this.activeEdgeObserved = false;
+      this.inactiveEdgeObserved = false;
+      this.inactiveEdgeSignal = "";
+      this.responseTurnConfirmedForObservation = false;
+      this.candidateResponseTurnElement = null;
+      this.ownedActiveSignal = "";
       this.notificationPreviewCandidate = "";
       this.notificationPreviewIdentity = "";
       this.notificationPreviewSourceLength = 0;
@@ -263,6 +339,7 @@
 
     rememberSubmissionResponseTurn() {
       const responseTurn = this.currentResponseTurn();
+      this.submissionResponseTurnElement = responseTurn;
       this.submissionResponseTurnIdentity = this.responseTurnIdentity(responseTurn);
     }
 
@@ -273,7 +350,9 @@
       ) {
         return true;
       }
-      const responseTurn = this.currentResponseTurn();
+      const responseTurn = snapshot && snapshot.responseTurnElement
+        ? snapshot.responseTurnElement
+        : this.currentResponseTurn();
       if (!responseTurn) {
         return false;
       }
@@ -282,6 +361,68 @@
         return true;
       }
       return false;
+    }
+
+    elementBelongsToResponseTurn(element, responseTurn) {
+      if (!element || !responseTurn) {
+        return false;
+      }
+      if (element === responseTurn) {
+        return true;
+      }
+      try {
+        if (
+          typeof responseTurn.contains === "function" &&
+          responseTurn.contains(element)
+        ) {
+          return true;
+        }
+      } catch (_error) {
+        // Treat an unreadable provider node as unverified.
+      }
+      if (typeof element.closest === "function") {
+        for (const selector of selectorList(this.selectors.responseTurn)) {
+          try {
+            if (element.closest(selector) === responseTurn) {
+              return true;
+            }
+          } catch (_error) {
+            // Treat an invalid provider selector as unverified.
+          }
+        }
+      }
+      if (typeof element.querySelectorAll === "function") {
+        const descendants = [];
+        for (const selector of selectorList(this.selectors.responseTurn)) {
+          try {
+            for (const match of element.querySelectorAll(selector)) {
+              if (!descendants.includes(match)) {
+                descendants.push(match);
+              }
+            }
+          } catch (_error) {
+            // Treat an invalid provider selector as unverified.
+          }
+        }
+        if (descendants.length === 1 && descendants[0] === responseTurn) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    activeSignalForTurn(snapshot, responseTurn) {
+      for (const element of snapshot.responseActiveElements || []) {
+        if (this.elementBelongsToResponseTurn(element, responseTurn)) {
+          return "response_active_marker_appeared";
+        }
+      }
+      for (const element of snapshot.stopElements || []) {
+        if (this.elementBelongsToResponseTurn(element, responseTurn)) {
+          return "stop_control_appeared";
+        }
+      }
+      return "";
     }
 
     notificationPreviewSourceText(responseTurn) {
@@ -361,25 +502,27 @@
     }
 
     handleInput(event) {
-      if (!closestMatch(event.target, this.selectors.composer)) {
+      const composer = closestMatch(event.target, this.selectors.composer);
+      if (!composer) {
         return;
       }
       this.emit({ type: "USER_INTERACTION", signal: "composer_input" });
       this.emit({
         type: "INPUT_CHANGED",
-        nonEmpty: composerNonEmpty(event.target)
+        nonEmpty: composerNonEmpty(composer)
       });
     }
 
     handleKeydown(event) {
-      if (!closestMatch(event.target, this.selectors.composer)) {
+      const composer = closestMatch(event.target, this.selectors.composer);
+      if (!composer) {
         return;
       }
       if (
         event.key === "Enter" &&
         !event.shiftKey &&
         !event.isComposing &&
-        composerNonEmpty(event.target)
+        composerNonEmpty(composer)
       ) {
         this.noteSubmission("composer_enter", "heuristic");
       }
@@ -388,17 +531,27 @@
     handleClick(event) {
       this.emit({ type: "USER_INTERACTION", signal: "click" });
       if (closestMatch(event.target, this.selectors.stop)) {
+        const observationEpoch = this.observationEpoch;
+        const turnLinkId = this.activeTurnLinkId;
         this.responseObserved = false;
         this.submissionPending = false;
         this.notificationPreviewCandidate = "";
         this.notificationPreviewIdentity = "";
         this.notificationPreviewSourceLength = 0;
         this.clearCompletionTimer();
+        this.clearObservationPolling();
+        if (this.responseSignalTimer) {
+          root.clearTimeout(this.responseSignalTimer);
+          this.responseSignalTimer = null;
+        }
         this.emit({
           type: "RESPONSE_CANCELLED",
           signal: "stop_control_clicked",
-          confidence: "derived"
+          confidence: "derived",
+          observationEpoch,
+          turnLinkId
         });
+        this.activeTurnLinkId = "";
         return;
       }
       if (closestMatch(event.target, this.selectors.send)) {
@@ -422,38 +575,116 @@
     }
 
     noteSubmission(signal, confidence) {
-      const submittedAt = Date.now();
+      const submittedAt = this.now();
       if (submittedAt - this.lastSubmissionAt < this.submissionDedupeMs) {
         return false;
       }
       this.lastSubmissionAt = submittedAt;
+      const observationEpoch = this.observationEpoch + 1;
+      this.observationEpoch = observationEpoch;
+      const turnLinkId = Core.randomUuid();
+      this.activeTurnLinkId = turnLinkId;
+      this.clearCompletionTimer();
+      this.clearObservationPolling();
+      if (this.responseSignalTimer) {
+        root.clearTimeout(this.responseSignalTimer);
+        this.responseSignalTimer = null;
+      }
       const baseline = this.snapshot();
+      this.lastSnapshot = baseline;
       this.submissionResponseTurnCount = baseline.responseTurnCount;
       this.responseObservedTurnCount = baseline.responseTurnCount;
       this.responseObserved = false;
       this.submissionPending = true;
+      this.activeEdgeObserved = false;
+      this.inactiveEdgeObserved = false;
+      this.inactiveEdgeSignal = "";
+      this.responseTurnConfirmedForObservation = false;
+      this.candidateResponseTurnElement = null;
+      this.ownedActiveSignal = "";
       this.notificationPreviewCandidate = "";
       this.notificationPreviewIdentity = "";
       this.notificationPreviewSourceLength = 0;
       this.rememberSubmissionResponseTurn();
-      this.clearCompletionTimer();
-      this.emit({ type: "PROMPT_SUBMITTED", signal, confidence });
-      if (this.responseSignalTimer) {
-        root.clearTimeout(this.responseSignalTimer);
-      }
+      this.emit({
+        type: "PROMPT_SUBMITTED",
+        signal,
+        confidence,
+        observationEpoch,
+        turnLinkId
+      });
       this.responseSignalTimer = root.setTimeout(() => {
-        if (!this.responseObserved) {
+        if (
+          observationEpoch === this.observationEpoch &&
+          this.submissionPending &&
+          !this.responseObserved
+        ) {
           this.reportUnhealthy("response_start_signal_timeout");
         }
       }, this.responseSignalTimeoutMs);
+      this.startObservationPolling(observationEpoch);
       return true;
     }
 
+    clearObservationPolling() {
+      if (this.observationPollTimer) {
+        root.clearTimeout(this.observationPollTimer);
+        this.observationPollTimer = null;
+      }
+      this.observationPollDeadline = 0;
+    }
+
+    startObservationPolling(observationEpoch) {
+      this.clearObservationPolling();
+      if (
+        !this.started ||
+        this.observationPollIntervalMs <= 0 ||
+        this.observationPollWindowMs <= 0
+      ) {
+        return;
+      }
+      this.observationPollDeadline = this.now() + this.observationPollWindowMs;
+      const poll = () => {
+        this.observationPollTimer = null;
+        if (
+          !this.started ||
+          observationEpoch !== this.observationEpoch ||
+          this.now() > this.observationPollDeadline ||
+          (!this.submissionPending && !this.responseObserved)
+        ) {
+          return;
+        }
+        this.handleSnapshot(this.snapshot(), observationEpoch);
+        if (
+          this.started &&
+          observationEpoch === this.observationEpoch &&
+          this.now() <= this.observationPollDeadline &&
+          (this.submissionPending || this.responseObserved)
+        ) {
+          this.observationPollTimer = root.setTimeout(
+            poll,
+            this.observationPollIntervalMs
+          );
+        }
+      };
+      this.observationPollTimer = root.setTimeout(
+        poll,
+        this.observationPollIntervalMs
+      );
+    }
+
     snapshot() {
+      const stopElements = queryElements(this.selectors.stop);
+      const responseActiveElements = queryElements(
+        this.selectors.responseActive
+      );
       return {
-        stopVisible: Boolean(queryFirst(this.selectors.stop)),
-        responseActiveVisible: Boolean(queryFirst(this.selectors.responseActive)),
+        stopVisible: stopElements.length > 0,
+        stopElements,
+        responseActiveVisible: responseActiveElements.length > 0,
+        responseActiveElements,
         responseTurnCount: queryCount(this.selectors.responseTurn),
+        responseTurnElement: this.currentResponseTurn(),
         errorVisible: Boolean(
           queryFirst(this.selectors.error)
         )
@@ -466,15 +697,22 @@
       }
       this.mutationTimer = root.setTimeout(() => {
         this.mutationTimer = null;
-        this.handleSnapshot(this.snapshot());
+        this.handleSnapshot(this.snapshot(), this.observationEpoch);
       }, 100);
     }
 
-    markResponseStarted(signal, confidence, snapshot) {
-      if (this.responseObserved) {
+    markResponseStarted(signal, confidence, snapshot, observationEpoch) {
+      if (
+        observationEpoch !== this.observationEpoch ||
+        this.responseObserved
+      ) {
         return;
       }
       this.responseObserved = true;
+      const leftCensored = !this.activeTurnLinkId;
+      if (!this.activeTurnLinkId) {
+        this.activeTurnLinkId = Core.randomUuid();
+      }
       this.responseObservedTurnCount = snapshot.responseTurnCount;
       if (this.responseSignalTimer) {
         root.clearTimeout(this.responseSignalTimer);
@@ -483,20 +721,41 @@
       this.emit({
         type: "RESPONSE_STARTED",
         signal,
-        confidence
+        confidence,
+        observationEpoch,
+        turnLinkId: this.activeTurnLinkId,
+        leftCensored
       });
     }
 
-    scheduleCompletion(signal, confidence) {
+    scheduleCompletion(signal, confidence, observationEpoch) {
       this.clearCompletionTimer();
       this.completionTimer = root.setTimeout(() => {
         this.completionTimer = null;
+        if (observationEpoch !== this.observationEpoch) {
+          return;
+        }
         const settled = this.snapshot();
+        const settledActiveSignal = this.requireActiveEdgeForCompletion
+          ? this.activeSignalForTurn(
+              settled,
+              this.candidateResponseTurnElement
+            )
+          : (
+              settled.stopVisible
+                ? "stop_control_appeared"
+                : settled.responseActiveVisible
+                  ? "response_active_marker_appeared"
+                  : ""
+            );
         if (
-          !settled.stopVisible &&
-          !settled.responseActiveVisible &&
+          !settledActiveSignal &&
           !settled.errorVisible &&
           this.responseObserved &&
+          (
+            !this.requireActiveEdgeForCompletion ||
+            this.inactiveEdgeObserved
+          ) &&
           (
             !this.requireResponseTurnForCompletion ||
             this.responseTurnConfirmed(settled)
@@ -506,25 +765,35 @@
             this.captureNotificationPreview(settled);
           this.responseObserved = false;
           this.submissionPending = false;
+          this.clearObservationPolling();
           this.notificationPreviewCandidate = "";
           this.notificationPreviewIdentity = "";
           this.notificationPreviewSourceLength = 0;
           const completedAction = {
             type: "RESPONSE_COMPLETED",
             signal,
-            confidence
+            confidence,
+            observationEpoch,
+            turnLinkId: this.activeTurnLinkId
           };
           if (notificationPreview) {
             completedAction.notification_preview = notificationPreview;
           }
           this.emit(completedAction);
+          this.activeTurnLinkId = "";
         }
       }, signal === "assistant_response_structure_quiet"
         ? this.responseQuietMs
         : this.completionSettleMs);
     }
 
-    handleSnapshot(next) {
+    handleSnapshot(next, observationEpoch) {
+      const epoch = Number.isInteger(observationEpoch)
+        ? observationEpoch
+        : this.observationEpoch;
+      if (epoch !== this.observationEpoch) {
+        return;
+      }
       const previous = this.lastSnapshot;
       this.lastSnapshot = next;
       if (next.errorVisible && this.responseObserved) {
@@ -534,37 +803,84 @@
         this.notificationPreviewIdentity = "";
         this.notificationPreviewSourceLength = 0;
         this.clearCompletionTimer();
+        this.clearObservationPolling();
         this.emit({
           type: "RESPONSE_FAILED",
           reason: "provider_error_control_visible",
-          confidence: "heuristic"
+          confidence: "heuristic",
+          observationEpoch: epoch,
+          turnLinkId: this.activeTurnLinkId
         });
+        this.activeTurnLinkId = "";
         return;
       }
-      const nextActive = next.stopVisible || next.responseActiveVisible;
-      const previousActive = previous.stopVisible || previous.responseActiveVisible;
+      const responseTurnConfirmed = this.responseTurnConfirmed(next);
+      const responseTurnBecameConfirmed = (
+        this.submissionPending &&
+        responseTurnConfirmed &&
+        !this.responseTurnConfirmedForObservation
+      );
+      if (responseTurnConfirmed) {
+        this.responseTurnConfirmedForObservation = true;
+      }
+      if (
+        responseTurnBecameConfirmed &&
+        next.responseTurnElement &&
+        next.responseTurnElement !== this.submissionResponseTurnElement
+      ) {
+        this.candidateResponseTurnElement = next.responseTurnElement;
+      }
+      const rawNextActive = next.stopVisible || next.responseActiveVisible;
+      const nextActiveSignal = this.requireActiveEdgeForCompletion
+        ? this.activeSignalForTurn(next, this.candidateResponseTurnElement)
+        : (
+            next.stopVisible
+              ? "stop_control_appeared"
+              : next.responseActiveVisible
+                ? "response_active_marker_appeared"
+                : ""
+          );
+      const previousActiveSignal = this.requireActiveEdgeForCompletion
+        ? this.ownedActiveSignal
+        : (
+            previous.stopVisible
+              ? "stop_control_appeared"
+              : previous.responseActiveVisible
+                ? "response_active_marker_appeared"
+                : ""
+          );
+      const nextActive = Boolean(nextActiveSignal);
+      const previousActive = Boolean(previousActiveSignal);
+      if (
+        this.requireActiveEdgeForCompletion &&
+        (this.submissionPending || this.responseObserved) &&
+        responseTurnConfirmed &&
+        rawNextActive &&
+        !nextActiveSignal
+      ) {
+        this.reportUnhealthy("response_active_scope_unverified");
+      }
       if (
         nextActive &&
         !previousActive &&
         (!this.requireSubmissionForResponseSignals || this.submissionPending)
       ) {
+        this.activeEdgeObserved = true;
+        this.inactiveEdgeObserved = false;
+        this.inactiveEdgeSignal = "";
         this.markResponseStarted(
-          next.stopVisible
-            ? "stop_control_appeared"
-            : "response_active_marker_appeared",
-          next.stopVisible ? "derived" : "heuristic",
-          next
+          nextActiveSignal,
+          nextActiveSignal.startsWith("stop_") ? "derived" : "heuristic",
+          next,
+          epoch
         );
       }
-      const responseTurnConfirmed = this.responseTurnConfirmed(next);
-      const responseTurnAdded = (
-        this.submissionPending && responseTurnConfirmed
-      );
-      if (!this.responseObserved && responseTurnAdded) {
+      if (!this.responseObserved && responseTurnBecameConfirmed) {
         this.markResponseStarted(
           "assistant_response_container_added",
           "heuristic",
-          next
+          next,
+          epoch
         );
       }
       if (next.responseTurnCount > this.responseObservedTurnCount) {
@@ -585,6 +901,19 @@
         );
       }
       if (
+        this.activeEdgeObserved &&
+        !nextActive &&
+        previousActive
+      ) {
+        this.inactiveEdgeObserved = true;
+        this.inactiveEdgeSignal = previousActiveSignal.startsWith("stop_")
+          ? "stop_control_disappeared_after_settle"
+          : "response_active_marker_disappeared_after_settle";
+      }
+      if (this.requireActiveEdgeForCompletion) {
+        this.ownedActiveSignal = nextActiveSignal;
+      }
+      if (
         this.responseObserved &&
         !nextActive &&
         previousActive &&
@@ -594,17 +923,37 @@
         )
       ) {
         this.scheduleCompletion(
-          previous.stopVisible
-            ? "stop_control_disappeared_after_settle"
-            : "response_active_marker_disappeared_after_settle",
-          previous.stopVisible ? "derived" : "heuristic"
-        );
-      } else if (this.responseObserved && !nextActive && responseTurnAdded) {
-        this.scheduleCompletion(
-          "assistant_response_structure_quiet",
-          "heuristic"
+          this.inactiveEdgeSignal,
+          this.inactiveEdgeSignal.startsWith("stop_")
+            ? "derived"
+            : "heuristic",
+          epoch
         );
       } else if (
+        this.requireActiveEdgeForCompletion &&
+        this.responseObserved &&
+        !nextActive &&
+        this.inactiveEdgeObserved &&
+        responseTurnBecameConfirmed
+      ) {
+        this.scheduleCompletion(
+          this.inactiveEdgeSignal,
+          this.inactiveEdgeSignal.startsWith("stop_") ? "derived" : "heuristic",
+          epoch
+        );
+      } else if (
+        !this.requireActiveEdgeForCompletion &&
+        this.responseObserved &&
+        !nextActive &&
+        responseTurnBecameConfirmed
+      ) {
+        this.scheduleCompletion(
+          "assistant_response_structure_quiet",
+          "heuristic",
+          epoch
+        );
+      } else if (
+        !this.requireActiveEdgeForCompletion &&
         this.responseObserved &&
         !nextActive &&
         responseTurnConfirmed &&
@@ -612,7 +961,8 @@
       ) {
         this.scheduleCompletion(
           "assistant_response_structure_quiet",
-          "heuristic"
+          "heuristic",
+          epoch
         );
       }
     }
@@ -630,6 +980,7 @@
     closestMatch,
     composerNonEmpty,
     queryCount,
+    queryElements,
     queryFirst,
     queryLast,
     selectorList

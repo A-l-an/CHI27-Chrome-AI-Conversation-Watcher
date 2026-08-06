@@ -6,12 +6,17 @@
   "source_commit": "dbfcf631ad838af1b104f18903d32303aa1e5e1f",
   "source_path": "01 Projects/CHI27 - Attention Modeling/03 Study Design/Version-C_Platform/08_Chrome-AI-Conversation-Watcher",
   "source_tree": "af318f523db7f53c960b91d4ee621987cc0ddcc0",
-  "product_version": "0.2.8",
+  "product_version": "0.2.9",
   "support_files": [
     {
       "destination": "tests/support/ai_conversation_ledger.py",
       "source_path": "01 Projects/CHI27 - Attention Modeling/03 Study Design/Version-C_Platform/09_AI-Conversation-Ledger/ai_conversation_ledger.py",
-      "source_blob": "bc01c9b01f6cb894043e60708777d89f591dd9f6"
+      "source_blob": "bc01c9b01f6cb894043e60708777d89f591dd9f6",
+      "fixture_status": "branch_local_adapted_fixture",
+      "branch_local_blob": "fa44383b54f0d8da47dd29ce1e6f201d056f4c72",
+      "branch_local_sha256": "fbb613dae782d49bb9d7f3f8b08bf4fc56e23b2ff5d2e8b5822394e4c9b697bb",
+      "canonical_sync_status": "not_synced",
+      "adaptation": "Schema 1.0/1.1 dual-read and turn_link_id-first test oracle for watcher branch validation."
     },
     {
       "destination": "tests/support/capture_window.py",
@@ -21,6 +26,7 @@
   ],
   "notes": [
     "Support files are test-only contract fixtures and are not part of the extension package.",
+    "The adapted Ledger fixture is branch-local and must not be treated as the canonical Vault Ledger until explicitly synchronized.",
     "Repository automation and standalone test paths were added after extraction."
   ]
 }

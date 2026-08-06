@@ -35,6 +35,7 @@ const SESSION_STATE_KEY = "study_session_state_v1";
 const RESPONSE_SESSION_STATE_KEY = "response_session_bindings_v1";
 const PRIVATE_RETURN_CUES_KEY = "rta_private_return_cues_v1";
 const LEGACY_PROFILE_SCOPE_KEY = "profile_scope_id";
+const LEGACY_QUEUE_QUARANTINE_KEY = "legacy_reliable_event_queue_quarantine_v1";
 const NOTIFICATION_TARGETS_KEY = "notification_targets_v1";
 const DIAGNOSTICS_KEY = "background_diagnostics_v1";
 const RETRY_ALARM = "flush-ai-conversation-events";
@@ -78,9 +79,19 @@ const NOTIFICATION_ERROR_CODES = new Set([
   "notification_permission_denied",
   "notification_target_storage_failed"
 ]);
+const LEGACY_QUEUE_ADAPTER_VERSIONS = new Set([
+  "0.2.8",
+  Core.ADAPTER_VERSION
+]);
+const LEGACY_QUEUE_EVENT_DATA_KEYS = new Set(
+  Array.from(Core.EVENT_DATA_KEYS).filter((key) => key !== "turn_link_id")
+);
+const LEGACY_QUEUE_VALIDATION_LINK =
+  "00000000-0000-4000-8000-000000000000";
 let ensuredBucketSignature = null;
 let ensuredSessionBucketSignature = null;
 let backgroundInitializationPromise = null;
+let conversationQueueMigrationPromise = null;
 let notificationTargetMutationChain = Promise.resolve();
 let responseSessionMutationChain = Promise.resolve();
 let privateReturnCueMutationChain = Promise.resolve();
@@ -273,6 +284,87 @@ async function recordErrorDiagnostic(fallbackCode, error, retryCount) {
   return recordDiagnostic(code, retryCount, httpStatus);
 }
 
+function strictLegacyContentFreeQueueEvent(candidate) {
+  if (
+    !candidate ||
+    typeof candidate !== "object" ||
+    Array.isArray(candidate) ||
+    Object.keys(candidate).length !== 3 ||
+    !["timestamp", "duration", "data"].every((key) =>
+      Object.hasOwn(candidate, key)
+    ) ||
+    !candidate.data ||
+    typeof candidate.data !== "object" ||
+    Array.isArray(candidate.data) ||
+    candidate.data.schema_version !== "1.0" ||
+    Object.hasOwn(candidate.data, "turn_link_id") ||
+    !LEGACY_QUEUE_ADAPTER_VERSIONS.has(candidate.data.adapter_version) ||
+    Object.keys(candidate.data).some(
+      (key) => !LEGACY_QUEUE_EVENT_DATA_KEYS.has(key)
+    )
+  ) {
+    return false;
+  }
+  const eventType = candidate.data.event_type;
+  const upgradedData = Object.assign({}, candidate.data, {
+    schema_version: Core.SCHEMA_VERSION,
+    adapter_version: Core.ADAPTER_VERSION
+  });
+  if (Core.TURN_LINK_EVENT_TYPES.has(eventType)) {
+    upgradedData.turn_link_id = LEGACY_QUEUE_VALIDATION_LINK;
+  }
+  const upgraded = Object.assign({}, candidate, { data: upgradedData });
+  return Boolean(Core.sanitizePersistedActivityWatchEvent(upgraded));
+}
+
+function strictLegacyContentFreeQueueItem(item) {
+  return Boolean(
+    item &&
+    typeof item === "object" &&
+    !Array.isArray(item) &&
+    Object.keys(item).length === 3 &&
+    ["event", "attempts", "next_attempt_at"].every((key) =>
+      Object.hasOwn(item, key)
+    ) &&
+    Number.isInteger(item.attempts) &&
+    item.attempts >= 0 &&
+    Number.isFinite(item.next_attempt_at) &&
+    strictLegacyContentFreeQueueEvent(item.event)
+  );
+}
+
+function strictLegacyQueueQuarantine(value) {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 2 &&
+    value.schema_version === "1.0" &&
+    Array.isArray(value.records) &&
+    value.records.every((entry) =>
+      entry &&
+      typeof entry === "object" &&
+      !Array.isArray(entry) &&
+      Object.keys(entry).length === 3 &&
+      Object.hasOwn(entry, "quarantined_at") &&
+      (
+        entry.reason_code === "lifecycle_missing_turn_link" &&
+        Core.TURN_LINK_EVENT_TYPES.has(
+          entry.record && entry.record.event && entry.record.event.data &&
+          entry.record.event.data.event_type
+        ) ||
+        entry.reason_code === "non_lifecycle_invalid_for_current_contract" &&
+        !Core.TURN_LINK_EVENT_TYPES.has(
+          entry.record && entry.record.event && entry.record.event.data &&
+          entry.record.event.data.event_type
+        )
+      ) &&
+      Number.isFinite(Date.parse(entry.quarantined_at)) &&
+      strictLegacyContentFreeQueueItem(entry.record)
+    )
+  );
+}
+
 function sanitizeQueueState(value) {
   const source = (
     value &&
@@ -280,10 +372,56 @@ function sanitizeQueueState(value) {
     Array.isArray(value.acknowledged)
   ) ? value : { pending: [], acknowledged: [] };
   const pending = [];
+  const quarantined = [];
   let changedCount = 0;
   let rejectedCount = 0;
+  let legacyLifecycleQuarantinedCount = 0;
+  let legacyNonLifecycleMigratedCount = 0;
+  let legacyNonLifecycleQuarantinedCount = 0;
+  let legacyUnsafePayloadBlockedCount = 0;
   for (const item of source.pending) {
-    const event = Core.sanitizePersistedActivityWatchEvent(item && item.event);
+    const candidate = item && item.event;
+    const candidateData = candidate && candidate.data;
+    const isLegacy = (
+      candidateData && candidateData.schema_version === "1.0"
+    );
+    let event = Core.sanitizePersistedActivityWatchEvent(candidate);
+    if (isLegacy && !event) {
+      const contentFree = strictLegacyContentFreeQueueItem(item);
+      if (!contentFree) {
+        // Keep the original bytes in their existing queue record. Migration
+        // will fail closed before any storage write, so no unsafe payload is
+        // copied, transmitted, or irreversibly removed.
+        legacyUnsafePayloadBlockedCount += 1;
+        pending.push(item);
+        continue;
+      }
+      if (Core.TURN_LINK_EVENT_TYPES.has(candidateData.event_type)) {
+        // A schema-1.0 lifecycle has no trustworthy join key. Preserve it for
+        // audit, but never send it or invent a link during upgrade.
+        legacyLifecycleQuarantinedCount += 1;
+        quarantined.push({
+          reason_code: "lifecycle_missing_turn_link",
+          record: item
+        });
+      } else {
+        const migratedCandidate = Object.assign({}, candidate, {
+          data: Object.assign({}, candidateData, {
+            schema_version: Core.SCHEMA_VERSION
+          })
+        });
+        event = Core.sanitizePersistedActivityWatchEvent(migratedCandidate);
+        if (event) {
+          legacyNonLifecycleMigratedCount += 1;
+        } else {
+          legacyNonLifecycleQuarantinedCount += 1;
+          quarantined.push({
+            reason_code: "non_lifecycle_invalid_for_current_contract",
+            record: item
+          });
+        }
+      }
+    }
     if (!event) {
       rejectedCount += 1;
       continue;
@@ -309,16 +447,23 @@ function sanitizeQueueState(value) {
       ).slice(-1000)
     },
     changed_count: changedCount,
-    rejected_count: rejectedCount
+    rejected_count: rejectedCount,
+    quarantined,
+    legacy_lifecycle_quarantined_count: legacyLifecycleQuarantinedCount,
+    legacy_non_lifecycle_migrated_count: legacyNonLifecycleMigratedCount,
+    legacy_non_lifecycle_quarantined_count: legacyNonLifecycleQuarantinedCount,
+    legacy_unsafe_payload_blocked_count: legacyUnsafePayloadBlockedCount
   };
 }
 
 const queueStore = {
   async get() {
+    await ensureConversationQueueMigration();
     const result = await storageGet(QUEUE_KEY);
     return sanitizeQueueState(result[QUEUE_KEY]).state;
   },
   async set(state) {
+    await ensureConversationQueueMigration();
     await storageSet({ [QUEUE_KEY]: state });
   }
 };
@@ -2033,10 +2178,18 @@ async function sweepExpiredNotifications() {
   }
 }
 
+function ensureConversationQueueMigration() {
+  if (!conversationQueueMigrationPromise) {
+    conversationQueueMigrationPromise = migrateLegacyStorageSafely();
+  }
+  return conversationQueueMigrationPromise;
+}
+
 async function migrateLegacyStorageSafely() {
   const stored = await storageGet([
     LEGACY_PROFILE_SCOPE_KEY,
     QUEUE_KEY,
+    LEGACY_QUEUE_QUARANTINE_KEY,
     NOTIFICATION_TARGETS_KEY
   ]);
   if (
@@ -2050,11 +2203,42 @@ async function migrateLegacyStorageSafely() {
     );
   }
   const queueMigration = sanitizeQueueState(stored[QUEUE_KEY]);
+  if (queueMigration.legacy_unsafe_payload_blocked_count > 0) {
+    await recordDiagnostic(
+      "legacy_queue_unsafe_payload_blocked",
+      0,
+      null,
+      { item_count: queueMigration.legacy_unsafe_payload_blocked_count }
+    );
+    throw makeDiagnosticError("legacy_queue_unsafe_payload_blocked");
+  }
   if (
     queueMigration.changed_count > 0 ||
     queueMigration.rejected_count > 0
   ) {
-    await storageSet({ [QUEUE_KEY]: queueMigration.state });
+    const storageUpdate = { [QUEUE_KEY]: queueMigration.state };
+    if (queueMigration.quarantined.length > 0) {
+      const existing = stored[LEGACY_QUEUE_QUARANTINE_KEY];
+      if (
+        typeof existing !== "undefined" &&
+        !strictLegacyQueueQuarantine(existing)
+      ) {
+        throw makeDiagnosticError("legacy_queue_quarantine_store_invalid");
+      }
+      const existingRecords = existing ? existing.records : [];
+      const quarantinedAt = new Date().toISOString();
+      storageUpdate[LEGACY_QUEUE_QUARANTINE_KEY] = {
+        schema_version: "1.0",
+        records: existingRecords.concat(
+          queueMigration.quarantined.map((entry) => ({
+            quarantined_at: quarantinedAt,
+            reason_code: entry.reason_code,
+            record: entry.record
+          }))
+        )
+      };
+    }
+    await storageSet(storageUpdate);
     if (queueMigration.changed_count > 0) {
       await recordDiagnostic(
         "legacy_queue_records_sanitized",
@@ -2069,6 +2253,30 @@ async function migrateLegacyStorageSafely() {
         0,
         null,
         { item_count: queueMigration.rejected_count }
+      );
+    }
+    if (queueMigration.legacy_non_lifecycle_migrated_count > 0) {
+      await recordDiagnostic(
+        "legacy_queue_safe_non_lifecycle_migrated",
+        0,
+        null,
+        { item_count: queueMigration.legacy_non_lifecycle_migrated_count }
+      );
+    }
+    if (queueMigration.legacy_lifecycle_quarantined_count > 0) {
+      await recordDiagnostic(
+        "legacy_queue_lifecycle_quarantined_missing_turn_link",
+        0,
+        null,
+        { item_count: queueMigration.legacy_lifecycle_quarantined_count }
+      );
+    }
+    if (queueMigration.legacy_non_lifecycle_quarantined_count > 0) {
+      await recordDiagnostic(
+        "legacy_queue_non_lifecycle_quarantined_invalid",
+        0,
+        null,
+        { item_count: queueMigration.legacy_non_lifecycle_quarantined_count }
       );
     }
   }
@@ -2451,7 +2659,7 @@ function initializeBackground() {
           await recordErrorDiagnostic("alarm_setup_failed", result.reason, 0);
         }
       }
-      await migrateLegacyStorageSafely();
+      await ensureConversationQueueMigration();
       await recoverInterruptedNotificationClaims();
       await sweepExpiredNotifications();
       await purgePrivateReturnCues();

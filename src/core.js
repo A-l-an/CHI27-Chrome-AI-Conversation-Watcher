@@ -9,7 +9,7 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function coreFactory(root) {
   "use strict";
 
-  const SCHEMA_VERSION = "1.0";
+  const SCHEMA_VERSION = "1.1";
   const ADAPTER_VERSION = "0.1.0";
   const SURFACE = "chrome";
   const PRIVACY_TIER = "content_free_local";
@@ -22,6 +22,7 @@
     "provider",
     "surface",
     "event_type",
+    "turn_link_id",
     "conversation_key",
     "identity_status",
     "namespace_generation",
@@ -56,6 +57,13 @@
     "user_returned",
     "user_engaged",
     "adapter_unhealthy"
+  ]);
+  const TURN_LINK_EVENT_TYPES = new Set([
+    "prompt_submitted",
+    "assistant_response_started",
+    "assistant_response_completed",
+    "assistant_response_failed",
+    "assistant_response_cancelled"
   ]);
   const SAFE_METADATA_KEYS = new Set([
     "adapter_health",
@@ -215,13 +223,18 @@
     }),
     adapter_unhealthy: Object.freeze({
       adapter_health: new Set(["unhealthy"]),
-      generation_state: new Set(["response_in_progress_at_navigation"]),
+      generation_state: new Set([
+        "response_in_progress_at_navigation",
+        "response_observation_incomplete_at_new_submission"
+      ]),
       observation_gap: new Set([true]),
       reason_code: new Set([
         "identity_bound_to_existing_conversation",
+        "new_submission_before_previous_terminal",
         "navigation_while_response_in_progress",
         "required_composer_missing",
         "required_composer_or_send_control_missing",
+        "response_active_scope_unverified",
         "response_start_signal_timeout",
         "route_identity_resolution_failed",
         "unknown"
@@ -434,6 +447,20 @@
         return false;
       }
     }
+    const turnLinkPresent = Object.hasOwn(data, "turn_link_id");
+    if (
+      turnLinkPresent !== TURN_LINK_EVENT_TYPES.has(data.event_type) ||
+      turnLinkPresent && !SOURCE_EVENT_ID_RE.test(data.turn_link_id || "")
+    ) {
+      return false;
+    }
+    if (
+      data.provider === "claude" &&
+      data.event_type === "assistant_response_completed" &&
+      data.metadata.completion_signal === "assistant_response_structure_quiet"
+    ) {
+      return false;
+    }
     return true;
   }
 
@@ -473,6 +500,13 @@
         reason_code: metadata.reason_code
       };
     }
+    if (
+      input.provider === "claude" &&
+      input.event_type === "assistant_response_completed" &&
+      metadata.completion_signal === "assistant_response_structure_quiet"
+    ) {
+      throw new Error("Claude completion requires an explicit inactive edge");
+    }
     const data = {
       schema_version: SCHEMA_VERSION,
       source_event_id: input.source_event_id || randomUuid(),
@@ -489,6 +523,14 @@
       privacy_tier: PRIVACY_TIER,
       metadata
     };
+    if (TURN_LINK_EVENT_TYPES.has(input.event_type)) {
+      if (!SOURCE_EVENT_ID_RE.test(input.turn_link_id || "")) {
+        throw new Error("turn_link_id is required for turn lifecycle events");
+      }
+      data.turn_link_id = input.turn_link_id;
+    } else if (typeof input.turn_link_id !== "undefined") {
+      throw new Error("turn_link_id is forbidden for non-turn events");
+    }
     if (
       Number.isInteger(input.conversation.namespace_generation) &&
       input.conversation.namespace_generation > 0 &&
@@ -574,6 +616,7 @@
       const rebuilt = buildActivityWatchEvent({
         provider: data.provider,
         event_type: data.event_type,
+        turn_link_id: data.turn_link_id,
         source_event_id: data.source_event_id,
         occurred_at: data.occurred_at,
         observed_at: data.observed_at,
@@ -605,6 +648,7 @@
     SAFE_METADATA_KEYS,
     SCHEMA_VERSION,
     SOURCE_EVENT_ID_RE,
+    TURN_LINK_EVENT_TYPES,
     buildActivityWatchEvent,
     buildTrackerNotificationRequest,
     cleanMetadata,

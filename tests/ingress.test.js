@@ -35,11 +35,13 @@ const CLAUDE_SENDER = {
   url: CLAUDE_FULL_URL,
   tab: { id: 8, windowId: 2, url: CLAUDE_FULL_URL }
 };
+const TURN_LINK_ID = "00000000-0000-4000-8000-0000000000a1";
 
 function validEvent() {
   return buildActivityWatchEvent({
     provider: "chatgpt",
     event_type: "prompt_submitted",
+    turn_link_id: TURN_LINK_ID,
     source_event_id: "00000000-0000-4000-8000-000000000001",
     occurred_at: "2026-07-23T00:00:00.000Z",
     observed_at: "2026-07-23T00:00:00.010Z",
@@ -62,6 +64,7 @@ function validClaudeCompletionEvent(completionSignal) {
   return buildActivityWatchEvent({
     provider: "claude",
     event_type: "assistant_response_completed",
+    turn_link_id: TURN_LINK_ID,
     source_event_id: "00000000-0000-4000-8000-000000000002",
     occurred_at: "2026-07-31T00:00:00.000Z",
     observed_at: "2026-07-31T00:00:00.010Z",
@@ -83,7 +86,8 @@ function validClaudeCompletionEvent(completionSignal) {
 function createClaudeCompletionFixture() {
   const state = {
     responseTurnCount: 1,
-    streaming: false
+    streaming: false,
+    responseTurns: []
   };
   const composerSelector =
     "div[data-testid='chat-input'][role='textbox'].tiptap.ProseMirror";
@@ -94,7 +98,21 @@ function createClaudeCompletionFixture() {
       return selector === composerSelector ? this : null;
     }
   };
-  const streaming = {};
+  function responseTurns() {
+    while (state.responseTurns.length < state.responseTurnCount) {
+      state.responseTurns.push({});
+    }
+    state.responseTurns.length = state.responseTurnCount;
+    return state.responseTurns;
+  }
+  const streaming = {
+    closest(selector) {
+      const turns = responseTurns();
+      return selector === ".font-claude-response"
+        ? turns[turns.length - 1]
+        : null;
+    }
+  };
   return {
     composer,
     state,
@@ -109,11 +127,11 @@ function createClaudeCompletionFixture() {
         return null;
       },
       querySelectorAll(selector) {
+        if (selector === "[data-is-streaming='true']") {
+          return state.streaming ? [streaming] : [];
+        }
         if (selector === ".font-claude-response") {
-          return Array.from(
-            { length: state.responseTurnCount },
-            () => ({})
-          );
+          return responseTurns();
         }
         return [];
       }
@@ -131,21 +149,28 @@ test("allowed provider-tab event is strictly rebuilt from the v1 allowlist", () 
   });
 });
 
-test("ingress accepts only the two fixed Claude completion signals", () => {
-  for (const completionSignal of [
-    "response_active_marker_disappeared_after_settle",
-    "assistant_response_structure_quiet"
-  ]) {
-    const rebuilt = rebuildContentEvent(
-      validClaudeCompletionEvent(completionSignal),
-      CLAUDE_SENDER,
-      EXTENSION_ID
-    );
-    assert.deepEqual(rebuilt.data.metadata, {
-      completion_signal: completionSignal,
-      state_transition: "responding_to_completed"
-    });
-  }
+test("ingress requires Claude completion to carry an explicit inactive-edge signal", () => {
+  const completionSignal =
+    "response_active_marker_disappeared_after_settle";
+  const rebuilt = rebuildContentEvent(
+    validClaudeCompletionEvent(completionSignal),
+    CLAUDE_SENDER,
+    EXTENSION_ID
+  );
+  assert.deepEqual(rebuilt.data.metadata, {
+    completion_signal: completionSignal,
+    state_transition: "responding_to_completed"
+  });
+
+  const quiet = structuredClone(
+    validClaudeCompletionEvent(completionSignal)
+  );
+  quiet.data.metadata.completion_signal =
+    "assistant_response_structure_quiet";
+  assert.throws(
+    () => rebuildContentEvent(quiet, CLAUDE_SENDER, EXTENSION_ID),
+    /metadata_value_invalid/
+  );
 
   assert.throws(
     () => rebuildContentEvent(
@@ -205,6 +230,7 @@ test("hidden Claude adapter completion survives state machine and ingress", asyn
     const candidate = buildActivityWatchEvent({
       provider: "claude",
       event_type: descriptor.event_type,
+      turn_link_id: descriptor.turn_link_id,
       source_event_id: "00000000-0000-4000-8000-000000000003",
       occurred_at: occurredAt,
       observed_at: occurredAt,
@@ -227,6 +253,7 @@ test("hidden Claude adapter completion survives state machine and ingress", asyn
       rebuilt.data.event_type,
       "assistant_response_completed"
     );
+    assert.equal(rebuilt.data.turn_link_id, descriptor.turn_link_id);
     assert.deepEqual(rebuilt.data.metadata, {
       completion_signal:
         "response_active_marker_disappeared_after_settle",
@@ -279,6 +306,31 @@ test("ingress rejects body fields, unknown fields, free-text smuggling, and wron
       EXTENSION_ID
     ),
     /sender_host_not_allowed/
+  );
+});
+
+test("ingress fail-closes stale or forged turn linkage", () => {
+  const missing = structuredClone(validEvent());
+  delete missing.data.turn_link_id;
+  assert.throws(
+    () => rebuildContentEvent(missing, SENDER, EXTENSION_ID),
+    /turn_link_id_invalid/
+  );
+
+  const staleV1 = structuredClone(validEvent());
+  staleV1.data.schema_version = "1.0";
+  delete staleV1.data.turn_link_id;
+  assert.throws(
+    () => rebuildContentEvent(staleV1, SENDER, EXTENSION_ID),
+    /contract_value_invalid/
+  );
+
+  const invalid = structuredClone(validEvent());
+  invalid.data.turn_link_id =
+    "00000000-0000-1000-8000-0000000000a1";
+  assert.throws(
+    () => rebuildContentEvent(invalid, SENDER, EXTENSION_ID),
+    /turn_link_id_invalid/
   );
 });
 

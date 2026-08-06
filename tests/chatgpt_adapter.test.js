@@ -142,6 +142,44 @@ test("ChatGPT adapter keeps composer, submit dedupe, and stop lifecycle after sh
   }
 });
 
+test("ChatGPT left-censored response start creates one link shared with completion", async () => {
+  const originalDocument = global.document;
+  const state = { stopVisible: false };
+  const stop = elementFor("button[data-testid='stop-button']");
+  global.document = {
+    querySelector(selector) {
+      return selector === "button[data-testid='stop-button']" && state.stopVisible
+        ? stop
+        : null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  try {
+    const actions = [];
+    const adapter = new ChatGptAdapter((action) => actions.push(action), {
+      completionSettleMs: 0
+    });
+    state.stopVisible = true;
+    adapter.handleSnapshot(adapter.snapshot());
+    state.stopVisible = false;
+    adapter.handleSnapshot(adapter.snapshot());
+    await wait(2);
+    assert.deepEqual(
+      actions.map((action) => action.type),
+      ["RESPONSE_STARTED", "RESPONSE_COMPLETED"]
+    );
+    assert.match(
+      actions[0].turnLinkId,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
+    assert.equal(actions[1].turnLinkId, actions[0].turnLinkId);
+  } finally {
+    global.document = originalDocument;
+  }
+});
+
 test("ChatGPT adapter preserves the full 150-character streaming preview across a short final DOM repaint", async () => {
   const originalDocument = global.document;
   const state = { assistantVisible: false, stopVisible: false };

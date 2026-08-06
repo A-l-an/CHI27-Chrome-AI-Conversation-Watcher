@@ -15,9 +15,17 @@ const expected = JSON.parse(
   fs.readFileSync(path.join(fixtureDir, "ledger_v1_expected.json"), "utf8")
 );
 
-test("ledger contract fixture is valid 08 output with three visits and two turns", () => {
+test("legacy v1.0 ledger fixture retains three visits and two turns", () => {
   assert.equal(events.length, expected.source_event_count);
-  assert.equal(events.every(validateActivityWatchEvent), true);
+  assert.equal(
+    events.every((event) => event.data.schema_version === "1.0"),
+    true
+  );
+  assert.equal(
+    events.every((event) => !validateActivityWatchEvent(event)),
+    true,
+    "current watcher output is closed to schema v1.1"
+  );
   assert.equal(
     events.filter((event) => event.data.event_type === "conversation_foregrounded").length,
     expected.visit_count
@@ -48,7 +56,7 @@ test("ledger contract fixture is valid 08 output with three visits and two turns
   assert.deepEqual(visitCounts, expected.conversation_visit_counts);
 });
 
-test("every provider-tab fixture event survives strict background reconstruction", () => {
+test("current ingress fail-closes legacy v1.0 provider-tab lifecycle input", () => {
   const extensionId = "fixture-extension";
   for (const event of events.filter((item) => item.data.provider === "chatgpt")) {
     const sender = {
@@ -57,8 +65,10 @@ test("every provider-tab fixture event survives strict background reconstruction
       url: "https://chatgpt.com/",
       tab: { id: 9, url: "https://chatgpt.com/" }
     };
-    const rebuilt = rebuildContentEvent(event, sender, extensionId);
-    assert.deepEqual(rebuilt, event);
+    assert.throws(
+      () => rebuildContentEvent(event, sender, extensionId),
+      /contract_value_invalid/
+    );
   }
 });
 

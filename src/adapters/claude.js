@@ -24,6 +24,7 @@
         },
         requireSubmissionForResponseSignals: true,
         requireResponseTurnForCompletion: true,
+        requireActiveEdgeForCompletion: true,
         selectors: {
           composer: [
             "div[data-testid='chat-input'][role='textbox'].tiptap.ProseMirror",

@@ -28,20 +28,45 @@ function createClaudeDomFixture() {
     responseTurnCount: 1,
     responseText: "  这是 Claude 的回答片段。\n请继续检查。  ",
     sendVisible: false,
-    streaming: false
+    streaming: false,
+    streamingOwner: null,
+    responseTurns: []
   };
+  function responseTurns() {
+    while (state.responseTurns.length < state.responseTurnCount) {
+      state.responseTurns.push(elementFor([RESPONSE_TURN]));
+    }
+    state.responseTurns.length = state.responseTurnCount;
+    state.responseTurns.forEach((turn, index) => {
+      turn.textContent = index === state.responseTurnCount - 1
+        ? state.responseText
+        : "较早的回答";
+    });
+    return state.responseTurns;
+  }
   const composer = elementFor([EXACT_COMPOSER], "x");
+  state.composer = composer;
   const send = elementFor([
     "button[aria-label='Send message' i], button[data-testid='send-button']"
   ]);
   const streaming = elementFor([STREAMING]);
+  streaming.closest = (selector) => {
+    if (selector === STREAMING) {
+      return streaming;
+    }
+    if (selector === RESPONSE_TURN) {
+      const turns = responseTurns();
+      return state.streamingOwner || turns[turns.length - 1] || null;
+    }
+    return null;
+  };
   const document = {
     documentElement: {},
     addEventListener() {},
     removeEventListener() {},
     querySelector(selector) {
       if (selector === EXACT_COMPOSER) {
-        return composer;
+        return state.composer;
       }
       if (
         selector ===
@@ -55,20 +80,27 @@ function createClaudeDomFixture() {
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === STREAMING) {
+        return state.streaming ? [streaming] : [];
+      }
       if (selector === RESPONSE_TURN) {
-        return Array.from(
-          { length: state.responseTurnCount },
-          (_value, index) => ({
-            textContent: index === state.responseTurnCount - 1
-              ? state.responseText
-              : "较早的回答"
-          })
-        );
+        return responseTurns();
       }
       return [];
     }
   };
-  return { composer, document, send, state };
+  return {
+    get composer() {
+      return state.composer;
+    },
+    document,
+    replaceComposer(textContent = "x") {
+      state.composer = elementFor([EXACT_COMPOSER], textContent);
+      return state.composer;
+    },
+    send,
+    state
+  };
 }
 
 function wait(ms) {
@@ -154,10 +186,10 @@ test("real-shaped Claude fixture deduplicates Enter/click submit and emits hidde
       1
     );
 
+    fixture.state.responseTurnCount = 2;
     fixture.state.streaming = true;
     adapter.handleSnapshot(adapter.snapshot());
     fixture.state.streaming = false;
-    fixture.state.responseTurnCount = 2;
     adapter.handleSnapshot(adapter.snapshot());
     await new Promise((resolve) => setTimeout(resolve, 10));
 
@@ -290,7 +322,7 @@ test("Claude observer captures hidden data-is-streaming true-to-false completion
   }
 });
 
-test("Claude explicit inactive marker requires a newly added response turn", async () => {
+test("Claude active marker without a new response turn cannot start lifecycle", async () => {
   const fixture = createClaudeDomFixture();
   const originalDocument = global.document;
   global.document = fixture.document;
@@ -309,7 +341,7 @@ test("Claude explicit inactive marker requires a newly added response turn", asy
 
     assert.deepEqual(
       actions.map((action) => action.type),
-      ["PROMPT_SUBMITTED", "RESPONSE_STARTED"]
+      ["PROMPT_SUBMITTED"]
     );
     clearTimeout(adapter.responseSignalTimer);
     adapter.responseSignalTimer = null;
@@ -380,7 +412,7 @@ test("Claude foreground completion records completion with only a suppressed aud
   }
 });
 
-test("Claude response-turn growth provides a quiet-period fallback without reading text", async () => {
+test("Claude response-turn growth starts a response but cannot guess completion from quiet", async () => {
   const fixture = createClaudeDomFixture();
   const originalDocument = global.document;
   global.document = fixture.document;
@@ -397,12 +429,10 @@ test("Claude response-turn growth provides a quiet-period fallback without readi
 
     assert.deepEqual(
       actions.map((action) => action.type),
-      ["PROMPT_SUBMITTED", "RESPONSE_STARTED", "RESPONSE_COMPLETED"]
+      ["PROMPT_SUBMITTED", "RESPONSE_STARTED"]
     );
     assert.equal(actions[1].signal, "assistant_response_container_added");
-    assert.equal(actions[2].signal, "assistant_response_structure_quiet");
     assert.equal(actions[1].confidence, "heuristic");
-    assert.equal(actions[2].confidence, "heuristic");
   } finally {
     global.document = originalDocument;
   }
@@ -430,5 +460,399 @@ test("Claude quiet fallback ignores arbitrary mutations when response structure 
     adapter.responseSignalTimer = null;
   } finally {
     global.document = originalDocument;
+  }
+});
+
+test("Claude delegated composer handling survives an SPA composer replacement", () => {
+  const fixture = createClaudeDomFixture();
+  const originalDocument = global.document;
+  global.document = fixture.document;
+  try {
+    const actions = [];
+    const adapter = new ClaudeAdapter((action) => actions.push(action), {
+      responseSignalTimeoutMs: 1000
+    });
+    const replacement = fixture.replaceComposer("replacement draft");
+    const nestedTarget = {
+      nodeType: 1,
+      textContent: "",
+      closest(selector) {
+        return selector === EXACT_COMPOSER ? replacement : null;
+      }
+    };
+    adapter.handleInput({ target: nestedTarget });
+    adapter.handleKeydown({
+      target: nestedTarget,
+      key: "Enter",
+      shiftKey: false,
+      isComposing: false
+    });
+    assert.equal(adapter.findComposer(), replacement);
+    assert.deepEqual(
+      actions.map((action) => action.type),
+      ["USER_INTERACTION", "INPUT_CHANGED", "PROMPT_SUBMITTED"]
+    );
+    clearTimeout(adapter.responseSignalTimer);
+    adapter.responseSignalTimer = null;
+  } finally {
+    global.document = originalDocument;
+  }
+});
+
+test("Claude ignores an unrelated form submit even when the global composer has a draft", () => {
+  const fixture = createClaudeDomFixture();
+  const originalDocument = global.document;
+  global.document = fixture.document;
+  try {
+    const actions = [];
+    const adapter = new ClaudeAdapter((action) => actions.push(action));
+    adapter.handleSubmit({
+      target: {
+        querySelector() {
+          return null;
+        }
+      }
+    });
+    assert.deepEqual(actions, []);
+  } finally {
+    global.document = originalDocument;
+  }
+});
+
+test("Claude adapter-to-machine accepts a fresh link at 1100 ms and recovers", async () => {
+  const fixture = createClaudeDomFixture();
+  const originalDocument = global.document;
+  global.document = fixture.document;
+  try {
+    let now = 0;
+    const machine = new ConversationStateMachine();
+    machine.dispatch({ type: "START", visible: true, at: now });
+    const events = [];
+    const adapter = new ClaudeAdapter((action) => {
+      events.push(...machine.dispatch(Object.assign({ at: now }, action)).events);
+    }, {
+      completionSettleMs: 0,
+      now: () => now,
+      responseSignalTimeoutMs: 1000
+    });
+
+    adapter.noteSubmission("composer_enter", "heuristic");
+    fixture.state.responseTurnCount = 2;
+    fixture.state.streaming = true;
+    now = 100;
+    adapter.handleSnapshot(adapter.snapshot());
+
+    now = 1100;
+    assert.equal(adapter.noteSubmission("composer_enter", "heuristic"), true);
+    fixture.state.streaming = false;
+    adapter.handleSnapshot(adapter.snapshot());
+    fixture.state.responseTurnCount = 3;
+    fixture.state.streaming = true;
+    adapter.handleSnapshot(adapter.snapshot());
+    fixture.state.streaming = false;
+    adapter.handleSnapshot(adapter.snapshot());
+    await wait(2);
+
+    const prompts = events.filter(
+      (event) => event.event_type === "prompt_submitted"
+    );
+    assert.equal(prompts.length, 2);
+    assert.notEqual(prompts[0].turn_link_id, prompts[1].turn_link_id);
+    assert.equal(
+      events.filter((event) => event.event_type === "adapter_unhealthy").length,
+      1
+    );
+    assert.equal(
+      events.some((event) => (
+        event.event_type === "assistant_response_completed" &&
+        event.turn_link_id === prompts[1].turn_link_id
+      )),
+      true
+    );
+  } finally {
+    global.document = originalDocument;
+  }
+});
+
+test("Claude records five continuous submissions as five independently linked lifecycles", async () => {
+  const fixture = createClaudeDomFixture();
+  const originalDocument = global.document;
+  global.document = fixture.document;
+  try {
+    const machine = new ConversationStateMachine();
+    machine.dispatch({ type: "START", visible: true, at: 0 });
+    const events = [];
+    const adapter = new ClaudeAdapter((action) => {
+      const at = Number.isInteger(action.observationEpoch)
+        ? action.observationEpoch * 2000
+        : Date.now();
+      events.push(...machine.dispatch(Object.assign({ at }, action)).events);
+    }, {
+      completionSettleMs: 0,
+      submissionDedupeMs: 0,
+      responseSignalTimeoutMs: 1000
+    });
+
+    for (let round = 0; round < 5; round += 1) {
+      assert.equal(adapter.noteSubmission("composer_enter", "heuristic"), true);
+      fixture.state.responseTurnCount += 1;
+      fixture.state.streaming = true;
+      adapter.handleSnapshot(adapter.snapshot());
+      fixture.state.streaming = false;
+      adapter.handleSnapshot(adapter.snapshot());
+      await wait(2);
+    }
+
+    const lifecycle = events.filter((event) => (
+      event.event_type === "prompt_submitted" ||
+      event.event_type.startsWith("assistant_response_")
+    ));
+    assert.equal(
+      lifecycle.filter((event) => event.event_type === "prompt_submitted").length,
+      5
+    );
+    assert.equal(
+      lifecycle.filter((event) => event.event_type === "assistant_response_started").length,
+      5
+    );
+    assert.equal(
+      lifecycle.filter((event) => event.event_type === "assistant_response_completed").length,
+      5
+    );
+    const links = new Set(lifecycle.map((event) => event.turn_link_id));
+    assert.equal(links.size, 5);
+    for (const link of links) {
+      assert.equal(
+        lifecycle.filter((event) => event.turn_link_id === link).length,
+        3
+      );
+    }
+  } finally {
+    global.document = originalDocument;
+  }
+});
+
+test("Claude abandons one stuck observation and lets the next submission recover", async () => {
+  const fixture = createClaudeDomFixture();
+  const originalDocument = global.document;
+  global.document = fixture.document;
+  try {
+    const machine = new ConversationStateMachine();
+    machine.dispatch({ type: "START", visible: true, at: 0 });
+    const events = [];
+    const adapter = new ClaudeAdapter((action) => {
+      const at = Number.isInteger(action.observationEpoch)
+        ? action.observationEpoch * 2000
+        : Date.now();
+      events.push(...machine.dispatch(Object.assign({ at }, action)).events);
+    }, {
+      completionSettleMs: 0,
+      submissionDedupeMs: 0,
+      responseSignalTimeoutMs: 1000
+    });
+
+    adapter.noteSubmission("composer_enter", "heuristic");
+    fixture.state.responseTurnCount = 2;
+    fixture.state.streaming = true;
+    adapter.handleSnapshot(adapter.snapshot());
+    const firstLink = events.find(
+      (event) => event.event_type === "prompt_submitted"
+    ).turn_link_id;
+
+    adapter.noteSubmission("composer_enter", "heuristic");
+    fixture.state.streaming = false;
+    adapter.handleSnapshot(adapter.snapshot());
+    fixture.state.responseTurnCount = 3;
+    fixture.state.streaming = true;
+    adapter.handleSnapshot(adapter.snapshot());
+    fixture.state.streaming = false;
+    adapter.handleSnapshot(adapter.snapshot());
+    await wait(2);
+
+    const prompts = events.filter(
+      (event) => event.event_type === "prompt_submitted"
+    );
+    assert.equal(prompts.length, 2);
+    assert.notEqual(prompts[0].turn_link_id, prompts[1].turn_link_id);
+    assert.equal(
+      events.filter((event) => event.event_type === "adapter_unhealthy").length,
+      1
+    );
+    assert.equal(
+      events.some((event) => (
+        event.event_type === "assistant_response_completed" &&
+        event.turn_link_id === firstLink
+      )),
+      false
+    );
+    assert.equal(
+      events.some((event) => (
+        event.event_type === "assistant_response_completed" &&
+        event.turn_link_id === prompts[1].turn_link_id
+      )),
+      true
+    );
+  } finally {
+    global.document = originalDocument;
+  }
+});
+
+test("Claude residual active DOM at submit cannot close until a fresh active edge falls", async () => {
+  const fixture = createClaudeDomFixture();
+  fixture.state.streaming = true;
+  const originalDocument = global.document;
+  global.document = fixture.document;
+  try {
+    const actions = [];
+    const adapter = new ClaudeAdapter((action) => actions.push(action), {
+      completionSettleMs: 0,
+      responseSignalTimeoutMs: 1000
+    });
+    adapter.noteSubmission("composer_enter", "heuristic");
+    fixture.state.streaming = false;
+    adapter.handleSnapshot(adapter.snapshot());
+    await wait(2);
+    assert.deepEqual(
+      actions.map((action) => action.type),
+      ["PROMPT_SUBMITTED"]
+    );
+
+    fixture.state.responseTurnCount = 2;
+    fixture.state.streaming = true;
+    adapter.handleSnapshot(adapter.snapshot());
+    fixture.state.streaming = false;
+    adapter.handleSnapshot(adapter.snapshot());
+    await wait(2);
+    assert.deepEqual(
+      actions.map((action) => action.type),
+      ["PROMPT_SUBMITTED", "RESPONSE_STARTED", "RESPONSE_COMPLETED"]
+    );
+    assert.equal(
+      new Set(actions.map((action) => action.turnLinkId)).size,
+      1
+    );
+  } finally {
+    global.document = originalDocument;
+  }
+});
+
+test("Claude cannot join an old turn marker edge to a new response container", async () => {
+  const fixture = createClaudeDomFixture();
+  const originalDocument = global.document;
+  global.document = fixture.document;
+  try {
+    const actions = [];
+    const adapter = new ClaudeAdapter((action) => actions.push(action), {
+      completionSettleMs: 0,
+      responseSignalTimeoutMs: 1000
+    });
+    adapter.noteSubmission("composer_enter", "heuristic");
+    const oldTurn = fixture.state.responseTurns[0];
+
+    fixture.state.responseTurnCount = 2;
+    fixture.state.streamingOwner = oldTurn;
+    fixture.state.streaming = true;
+    adapter.handleSnapshot(adapter.snapshot());
+    fixture.state.streaming = false;
+    adapter.handleSnapshot(adapter.snapshot());
+    await wait(2);
+
+    assert.equal(
+      actions.filter((action) => action.type === "RESPONSE_COMPLETED").length,
+      0
+    );
+    assert.equal(
+      actions.some((action) => (
+        action.type === "ADAPTER_UNHEALTHY" &&
+        action.reason === "response_active_scope_unverified"
+      )),
+      true
+    );
+
+    fixture.state.streamingOwner = fixture.state.responseTurns[1];
+    fixture.state.streaming = true;
+    adapter.handleSnapshot(adapter.snapshot());
+    fixture.state.streaming = false;
+    adapter.handleSnapshot(adapter.snapshot());
+    await wait(2);
+    assert.equal(
+      actions.filter((action) => action.type === "RESPONSE_COMPLETED").length,
+      1
+    );
+  } finally {
+    global.document = originalDocument;
+  }
+});
+
+test("Claude bounded polling recovers a missed observer callback", async () => {
+  const fixture = createClaudeDomFixture();
+  const observerFixture = installMutationObserverFixture();
+  const originalDocument = global.document;
+  const originalMutationObserver = global.MutationObserver;
+  global.document = fixture.document;
+  global.MutationObserver = observerFixture.FixtureMutationObserver;
+  let adapter;
+  try {
+    const actions = [];
+    adapter = new ClaudeAdapter((action) => actions.push(action), {
+      completionSettleMs: 0,
+      healthGraceMs: 1000,
+      observationPollIntervalMs: 2,
+      observationPollWindowMs: 100,
+      responseSignalTimeoutMs: 100
+    });
+    adapter.start();
+    adapter.noteSubmission("composer_enter", "heuristic");
+    fixture.state.responseTurnCount = 2;
+    fixture.state.streaming = true;
+    await wait(10);
+    fixture.state.streaming = false;
+    await wait(10);
+    assert.deepEqual(
+      actions.map((action) => action.type),
+      ["PROMPT_SUBMITTED", "RESPONSE_STARTED", "RESPONSE_COMPLETED"]
+    );
+  } finally {
+    if (adapter) {
+      adapter.stop();
+    }
+    global.document = originalDocument;
+    global.MutationObserver = originalMutationObserver;
+  }
+});
+
+test("Claude no-signal observation reports unhealthy without inventing a completion", async () => {
+  const fixture = createClaudeDomFixture();
+  const observerFixture = installMutationObserverFixture();
+  const originalDocument = global.document;
+  const originalMutationObserver = global.MutationObserver;
+  global.document = fixture.document;
+  global.MutationObserver = observerFixture.FixtureMutationObserver;
+  let adapter;
+  try {
+    const actions = [];
+    adapter = new ClaudeAdapter((action) => actions.push(action), {
+      healthGraceMs: 1000,
+      observationPollIntervalMs: 2,
+      observationPollWindowMs: 10,
+      responseSignalTimeoutMs: 10
+    });
+    adapter.start();
+    adapter.noteSubmission("composer_enter", "heuristic");
+    await wait(25);
+    assert.deepEqual(
+      actions.map((action) => action.type),
+      ["PROMPT_SUBMITTED", "ADAPTER_UNHEALTHY"]
+    );
+    assert.equal(
+      actions.some((action) => action.type === "RESPONSE_COMPLETED"),
+      false
+    );
+  } finally {
+    if (adapter) {
+      adapter.stop();
+    }
+    global.document = originalDocument;
+    global.MutationObserver = originalMutationObserver;
   }
 });

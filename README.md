@@ -1,6 +1,6 @@
 # CHI27 Chrome AI Conversation Watcher
 
-Chrome 0.2.8 源码仓库。扩展观察 ChatGPT/Claude 网页端的对话切换、回答完成、通知点击与返回行为，并向本机 ActivityWatch 写入不含正文的事件。回答开头最多 150 个字符只用于短暂系统通知，不进入 ActivityWatch 或常规导出。
+Chrome 0.2.9 源码仓库。扩展观察 ChatGPT/Claude 网页端的对话切换、回答完成、通知点击与返回行为，并向本机 ActivityWatch 写入不含正文的事件。回答开头最多 150 个字符只用于短暂系统通知，不进入 ActivityWatch 或常规导出。
 
 验证与打包：`npm test`，随后运行 `npm run package`。后者根据 `manifest.json`、HTML、CSS 与 `background.js` 的实际引用动态计算闭包，生成可复现的 `dist/*-unpacked-extension.zip`、SHA-256 sidecar 与构建 manifest。源码仓库故意不含生成的 `participant_config.json`；参与者编号只能由上层受控打包流程注入。
 
