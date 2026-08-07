@@ -8,6 +8,7 @@
     "test:node": "node --test tests/*.test.js",
     "test:python": "python tests/event_link_id_golden_test.py",
     "test:package": "python tests/package_extension_test.py",
-    "package": "python scripts/package_extension.py"
+    "package": "python scripts/package_extension.py",
+    "verify:package": "python scripts/verify_extension_artifact.py --artifact-dir dist"
   }
 }

@@ -107,6 +107,60 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function createManualTimerFixture() {
+  let now = 0;
+  let nextId = 1;
+  const timers = new Map();
+
+  function scheduleTimeout(callback, delay = 0) {
+    const id = nextId;
+    nextId += 1;
+    timers.set(id, {
+      at: now + Math.max(0, Number.isFinite(delay) ? delay : 0),
+      callback
+    });
+    return id;
+  }
+
+  function cancelTimeout(id) {
+    timers.delete(id);
+  }
+
+  function advance(duration) {
+    const target = now + duration;
+    while (true) {
+      let nextTimer = null;
+      for (const [id, timer] of timers.entries()) {
+        if (timer.at > target) {
+          continue;
+        }
+        if (
+          !nextTimer ||
+          timer.at < nextTimer.at ||
+          (timer.at === nextTimer.at && id < nextTimer.id)
+        ) {
+          nextTimer = { id, at: timer.at, callback: timer.callback };
+        }
+      }
+      if (!nextTimer) {
+        break;
+      }
+      timers.delete(nextTimer.id);
+      now = nextTimer.at;
+      nextTimer.callback();
+    }
+    now = target;
+  }
+
+  return {
+    now: () => now,
+    scheduleTimeout,
+    cancelTimeout,
+    advance,
+    pendingCount: () => timers.size
+  };
+}
+
 function installMutationObserverFixture() {
   const instances = [];
   class FixtureMutationObserver {
@@ -784,9 +838,10 @@ test("Claude cannot join an old turn marker edge to a new response container", a
   }
 });
 
-test("Claude bounded polling recovers a missed observer callback", async () => {
+test("Claude bounded polling recovers a missed observer callback", () => {
   const fixture = createClaudeDomFixture();
   const observerFixture = installMutationObserverFixture();
+  const timerFixture = createManualTimerFixture();
   const originalDocument = global.document;
   const originalMutationObserver = global.MutationObserver;
   global.document = fixture.document;
@@ -799,19 +854,43 @@ test("Claude bounded polling recovers a missed observer callback", async () => {
       healthGraceMs: 1000,
       observationPollIntervalMs: 2,
       observationPollWindowMs: 100,
-      responseSignalTimeoutMs: 100
+      responseSignalTimeoutMs: 100,
+      now: timerFixture.now,
+      scheduleTimeout: timerFixture.scheduleTimeout,
+      cancelTimeout: timerFixture.cancelTimeout
     });
     adapter.start();
+    const observer = observerFixture.instances[0];
+    assert.ok(observer);
+    let observerCallbackCount = 0;
+    const observerCallback = observer.callback;
+    observer.callback = (...args) => {
+      observerCallbackCount += 1;
+      return observerCallback(...args);
+    };
     adapter.noteSubmission("composer_enter", "heuristic");
     fixture.state.responseTurnCount = 2;
     fixture.state.streaming = true;
-    await wait(10);
+    timerFixture.advance(2);
     fixture.state.streaming = false;
-    await wait(10);
+    timerFixture.advance(2);
     assert.deepEqual(
       actions.map((action) => action.type),
       ["PROMPT_SUBMITTED", "RESPONSE_STARTED", "RESPONSE_COMPLETED"]
     );
+    assert.equal(observerCallbackCount, 0);
+    const [submitted, started, completed] = actions;
+    assert.equal(typeof submitted.turnLinkId, "string");
+    assert.notEqual(submitted.turnLinkId, "");
+    assert.equal(typeof started.turnLinkId, "string");
+    assert.notEqual(started.turnLinkId, "");
+    assert.equal(typeof completed.turnLinkId, "string");
+    assert.notEqual(completed.turnLinkId, "");
+    assert.equal(started.turnLinkId, submitted.turnLinkId);
+    assert.equal(completed.turnLinkId, submitted.turnLinkId);
+    adapter.stop();
+    adapter = null;
+    assert.equal(timerFixture.pendingCount(), 0);
   } finally {
     if (adapter) {
       adapter.stop();

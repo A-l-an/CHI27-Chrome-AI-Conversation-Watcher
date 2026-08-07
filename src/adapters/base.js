@@ -155,6 +155,12 @@
       this.selectors = config.selectors;
       this.onAction = config.onAction;
       this.now = typeof config.now === "function" ? config.now : Date.now;
+      this.scheduleTimeout = typeof config.scheduleTimeout === "function"
+        ? config.scheduleTimeout
+        : (callback, delay) => root.setTimeout(callback, delay);
+      this.cancelTimeout = typeof config.cancelTimeout === "function"
+        ? config.cancelTimeout
+        : (timer) => root.clearTimeout(timer);
       this.healthGraceMs = Number.isFinite(config.healthGraceMs)
         ? config.healthGraceMs
         : 10000;
@@ -249,7 +255,10 @@
         this.mutationObserverOptions
       );
       this.lastSnapshot = this.snapshot();
-      this.healthTimer = root.setTimeout(() => this.checkHealth(), this.healthGraceMs);
+      this.healthTimer = this.scheduleTimeout(
+        () => this.checkHealth(),
+        this.healthGraceMs
+      );
     }
 
     stop() {
@@ -273,7 +282,7 @@
         this.observationPollTimer
       ]) {
         if (timer) {
-          root.clearTimeout(timer);
+          this.cancelTimeout(timer);
         }
       }
       this.observationEpoch += 1;
@@ -297,7 +306,7 @@
       this.clearCompletionTimer();
       this.clearObservationPolling();
       if (this.responseSignalTimer) {
-        root.clearTimeout(this.responseSignalTimer);
+        this.cancelTimeout(this.responseSignalTimer);
         this.responseSignalTimer = null;
       }
       this.lastSnapshot = this.snapshot();
@@ -541,7 +550,7 @@
         this.clearCompletionTimer();
         this.clearObservationPolling();
         if (this.responseSignalTimer) {
-          root.clearTimeout(this.responseSignalTimer);
+          this.cancelTimeout(this.responseSignalTimer);
           this.responseSignalTimer = null;
         }
         this.emit({
@@ -587,7 +596,7 @@
       this.clearCompletionTimer();
       this.clearObservationPolling();
       if (this.responseSignalTimer) {
-        root.clearTimeout(this.responseSignalTimer);
+        this.cancelTimeout(this.responseSignalTimer);
         this.responseSignalTimer = null;
       }
       const baseline = this.snapshot();
@@ -613,7 +622,7 @@
         observationEpoch,
         turnLinkId
       });
-      this.responseSignalTimer = root.setTimeout(() => {
+      this.responseSignalTimer = this.scheduleTimeout(() => {
         if (
           observationEpoch === this.observationEpoch &&
           this.submissionPending &&
@@ -628,7 +637,7 @@
 
     clearObservationPolling() {
       if (this.observationPollTimer) {
-        root.clearTimeout(this.observationPollTimer);
+        this.cancelTimeout(this.observationPollTimer);
         this.observationPollTimer = null;
       }
       this.observationPollDeadline = 0;
@@ -661,13 +670,13 @@
           this.now() <= this.observationPollDeadline &&
           (this.submissionPending || this.responseObserved)
         ) {
-          this.observationPollTimer = root.setTimeout(
+          this.observationPollTimer = this.scheduleTimeout(
             poll,
             this.observationPollIntervalMs
           );
         }
       };
-      this.observationPollTimer = root.setTimeout(
+      this.observationPollTimer = this.scheduleTimeout(
         poll,
         this.observationPollIntervalMs
       );
@@ -695,7 +704,7 @@
       if (this.mutationTimer) {
         return;
       }
-      this.mutationTimer = root.setTimeout(() => {
+      this.mutationTimer = this.scheduleTimeout(() => {
         this.mutationTimer = null;
         this.handleSnapshot(this.snapshot(), this.observationEpoch);
       }, 100);
@@ -715,7 +724,7 @@
       }
       this.responseObservedTurnCount = snapshot.responseTurnCount;
       if (this.responseSignalTimer) {
-        root.clearTimeout(this.responseSignalTimer);
+        this.cancelTimeout(this.responseSignalTimer);
         this.responseSignalTimer = null;
       }
       this.emit({
@@ -730,7 +739,7 @@
 
     scheduleCompletion(signal, confidence, observationEpoch) {
       this.clearCompletionTimer();
-      this.completionTimer = root.setTimeout(() => {
+      this.completionTimer = this.scheduleTimeout(() => {
         this.completionTimer = null;
         if (observationEpoch !== this.observationEpoch) {
           return;
@@ -969,7 +978,7 @@
 
     clearCompletionTimer() {
       if (this.completionTimer) {
-        root.clearTimeout(this.completionTimer);
+        this.cancelTimeout(this.completionTimer);
         this.completionTimer = null;
       }
     }
