@@ -155,7 +155,7 @@ def rewrite_self_consistent_artifact(
             info.external_attr = 0o100644 << 16
             handle.writestr(info, payloads[relative])
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    sidecar.write_text(f"{digest}  {archive.name}\n", encoding="ascii")
+    sidecar.write_bytes(f"{digest}  {archive.name}\n".encode("ascii"))
     manifest = json.loads(build_manifest.read_text(encoding="utf-8"))
     manifest["sha256"] = digest
     manifest["files"] = sorted(payloads)
