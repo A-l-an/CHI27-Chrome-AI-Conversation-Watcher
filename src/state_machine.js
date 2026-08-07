@@ -9,6 +9,7 @@
   "use strict";
 
   const SUBMIT_DEDUPE_MS = 1500;
+  const TURN_LINK_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
   class ConversationStateMachine {
     constructor(options) {
@@ -19,8 +20,12 @@
       this.interactionPending = false;
       this.engagementPending = false;
       this.draftNonEmpty = false;
+      this.awaitingResponse = false;
       this.responding = false;
+      this.activeObservationEpoch = null;
+      this.activeTurnLinkId = "";
       this.lastSubmitAt = -Infinity;
+      this.lastSubmitTurnLinkId = "";
       this.started = false;
     }
 
@@ -28,8 +33,17 @@
       const events = [];
       const effects = [];
       const at = Number.isFinite(action.at) ? action.at : this.now();
-      const emit = (event_type, confidence, metadata) => {
-        events.push({ event_type, confidence, metadata: metadata || {}, at });
+      const emit = (event_type, confidence, metadata, turnLinkId) => {
+        const descriptor = {
+          event_type,
+          confidence,
+          metadata: metadata || {},
+          at
+        };
+        if (TURN_LINK_RE.test(turnLinkId || "")) {
+          descriptor.turn_link_id = turnLinkId;
+        }
+        events.push(descriptor);
       };
       const interactIfPending = (signal) => {
         if (this.foreground && this.interactionPending) {
@@ -48,6 +62,32 @@
             state_transition: "returned_to_engaged"
           });
         }
+      };
+      const observationMatches = () => (
+        (
+          this.activeObservationEpoch === null ||
+          Number.isInteger(action.observationEpoch) &&
+          action.observationEpoch === this.activeObservationEpoch
+        ) && (
+          !this.activeTurnLinkId ||
+          TURN_LINK_RE.test(action.turnLinkId || "") &&
+          action.turnLinkId === this.activeTurnLinkId
+        )
+      );
+      const clearResponseObservation = () => {
+        this.awaitingResponse = false;
+        this.responding = false;
+        this.activeObservationEpoch = null;
+        this.activeTurnLinkId = "";
+      };
+      const emitObservationGap = (reason, generationState) => {
+        emit("adapter_unhealthy", "exact", {
+          adapter_health: "unhealthy",
+          generation_state: generationState,
+          observation_gap: true,
+          reason_code: reason
+        });
+        clearResponseObservation();
       };
 
       switch (action.type) {
@@ -109,32 +149,76 @@
           break;
         }
         case "PROMPT_SUBMITTED":
-          if (at - this.lastSubmitAt >= SUBMIT_DEDUPE_MS) {
+          {
+            const submittedTurnLinkId = TURN_LINK_RE.test(
+              action.turnLinkId || ""
+            ) ? action.turnLinkId : "";
+            const duplicateWithinWindow = (
+              at - this.lastSubmitAt < SUBMIT_DEDUPE_MS &&
+              (
+                !submittedTurnLinkId ||
+                submittedTurnLinkId === this.lastSubmitTurnLinkId
+              )
+            );
+            if (duplicateWithinWindow) {
+              break;
+            }
+            if (this.awaitingResponse || this.responding) {
+              emitObservationGap(
+                "new_submission_before_previous_terminal",
+                "response_observation_incomplete_at_new_submission"
+              );
+            }
             this.lastSubmitAt = at;
+            this.lastSubmitTurnLinkId = submittedTurnLinkId;
             this.draftNonEmpty = false;
+            this.awaitingResponse = true;
+            this.responding = false;
+            this.activeObservationEpoch = Number.isInteger(action.observationEpoch)
+              ? action.observationEpoch
+              : null;
+            this.activeTurnLinkId = submittedTurnLinkId;
             emit("prompt_submitted", action.confidence || "derived", {
               signal: action.signal || "submit_control",
               state_transition: "draft_to_submitted"
-            });
+            }, this.activeTurnLinkId);
             engageIfPending("prompt_submitted");
           }
           break;
         case "RESPONSE_STARTED":
-          if (!this.responding) {
+          if (
+            observationMatches() &&
+            !this.responding &&
+            (
+              this.awaitingResponse ||
+              (
+                action.leftCensored === true &&
+                TURN_LINK_RE.test(action.turnLinkId || "")
+              )
+            )
+          ) {
+            this.awaitingResponse = true;
             this.responding = true;
+            if (Number.isInteger(action.observationEpoch)) {
+              this.activeObservationEpoch = action.observationEpoch;
+            }
+            if (TURN_LINK_RE.test(action.turnLinkId || "")) {
+              this.activeTurnLinkId = action.turnLinkId;
+            }
             emit("assistant_response_started", action.confidence || "derived", {
               signal: action.signal || "stop_control_appeared",
               state_transition: "submitted_to_responding"
-            });
+            }, this.activeTurnLinkId);
           }
           break;
         case "RESPONSE_COMPLETED":
-          if (this.responding) {
-            this.responding = false;
+          if (observationMatches() && this.responding) {
+            const turnLinkId = this.activeTurnLinkId;
+            clearResponseObservation();
             emit("assistant_response_completed", action.confidence || "derived", {
               completion_signal: action.signal || "stop_control_disappeared",
               state_transition: "responding_to_completed"
-            });
+            }, turnLinkId);
             if (!this.foreground) {
               effects.push({
                 type: "SHOW_TRACKER_NOTIFICATION",
@@ -149,32 +233,37 @@
           }
           break;
         case "RESPONSE_FAILED":
-          if (this.responding) {
-            this.responding = false;
+          if (observationMatches() && this.responding) {
+            const turnLinkId = this.activeTurnLinkId;
+            clearResponseObservation();
             emit("assistant_response_failed", action.confidence || "heuristic", {
               reason_code: action.reason || "provider_error_control",
               state_transition: "responding_to_failed"
-            });
+            }, turnLinkId);
           }
           break;
         case "RESPONSE_CANCELLED":
-          if (this.responding) {
-            this.responding = false;
+          if (
+            observationMatches() &&
+            (this.awaitingResponse || this.responding)
+          ) {
+            const turnLinkId = this.activeTurnLinkId;
+            clearResponseObservation();
             emit("assistant_response_cancelled", action.confidence || "derived", {
               signal: action.signal || "stop_control_clicked",
               state_transition: "responding_to_cancelled"
-            });
+            }, turnLinkId);
           }
           break;
         case "OBSERVATION_GAP":
-          if (this.responding) {
-            this.responding = false;
-            emit("adapter_unhealthy", "exact", {
-              adapter_health: "unhealthy",
-              generation_state: "response_in_progress_at_navigation",
-              observation_gap: true,
-              reason_code: action.reason || "navigation_while_response_in_progress"
-            });
+          if (
+            observationMatches() &&
+            (this.awaitingResponse || this.responding)
+          ) {
+            emitObservationGap(
+              action.reason || "navigation_while_response_in_progress",
+              action.generationState || "response_in_progress_at_navigation"
+            );
           }
           break;
         case "ADAPTER_UNHEALTHY":
@@ -231,12 +320,14 @@
       }
       const previousKey = this.currentKey;
       const previous = this.sessions.get(previousKey);
-      if (previous.responding) {
+      if (previous.awaitingResponse || previous.responding) {
         transitions.push({
           conversation_key: previousKey,
           result: previous.dispatch({
             type: "OBSERVATION_GAP",
             reason: "navigation_while_response_in_progress",
+            observationEpoch: previous.activeObservationEpoch,
+            turnLinkId: previous.activeTurnLinkId,
             at: opts.at
           })
         });
@@ -278,12 +369,14 @@
       const current = this.sessions.get(oldConversationKey);
       const existing = this.sessions.get(newConversationKey);
       if (existing) {
-        if (current.responding) {
+        if (current.awaitingResponse || current.responding) {
           transitions.push({
             conversation_key: oldConversationKey,
             result: current.dispatch({
               type: "OBSERVATION_GAP",
               reason: "identity_bound_to_existing_conversation",
+              observationEpoch: current.activeObservationEpoch,
+              turnLinkId: current.activeTurnLinkId,
               at: opts.at
             })
           });

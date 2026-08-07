@@ -34,6 +34,7 @@
     "provider",
     "surface",
     "event_type",
+    "turn_link_id",
     "conversation_key",
     "identity_status",
     "namespace_generation",
@@ -50,10 +51,11 @@
     claude: new Set(["claude.ai", "www.claude.ai"])
   });
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   const EXACT_KEY_RE = /^[0-9a-f]{64}$/;
   const LOCATOR_HANDLE_RE = AuthorityClient.LOCATOR_HANDLE_RE;
   const NAMESPACE_FINGERPRINT_RE = /^[A-Za-z0-9._:-]{16,255}$/;
-  const SOURCE_ID_RE = UUID_RE;
+  const SOURCE_ID_RE = UUID_V4_RE;
   const CONTENT_METADATA_VALUES = Object.freeze({
     adapter_health: new Set(["starting", "unhealthy"]),
     completion_signal: new Set([
@@ -62,14 +64,19 @@
       "stop_control_disappeared",
       "stop_control_disappeared_after_settle"
     ]),
-    generation_state: new Set(["response_in_progress_at_navigation"]),
+    generation_state: new Set([
+      "response_in_progress_at_navigation",
+      "response_observation_incomplete_at_new_submission"
+    ]),
     reason_code: new Set([
       "identity_bound_to_existing_conversation",
+      "new_submission_before_previous_terminal",
       "navigation_while_response_in_progress",
       "provider_error_control",
       "provider_error_control_visible",
       "required_composer_missing",
       "required_composer_or_send_control_missing",
+      "response_active_scope_unverified",
       "response_start_signal_timeout",
       "route_identity_resolution_failed",
       "unknown"
@@ -275,13 +282,28 @@
       reject("contract_value_invalid");
     }
     validateConversationIdentity(data);
+    const turnLinkPresent = Object.hasOwn(data, "turn_link_id");
+    if (
+      turnLinkPresent !== Core.TURN_LINK_EVENT_TYPES.has(data.event_type) ||
+      turnLinkPresent && !SOURCE_ID_RE.test(data.turn_link_id || "")
+    ) {
+      reject("turn_link_id_invalid");
+    }
     validateMetadata(data.metadata);
     if (!Core.validMetadataForEvent(data.event_type, data.metadata, true)) {
+      reject("metadata_value_invalid");
+    }
+    if (
+      provider === "claude" &&
+      data.event_type === "assistant_response_completed" &&
+      data.metadata.completion_signal === "assistant_response_structure_quiet"
+    ) {
       reject("metadata_value_invalid");
     }
     return Core.buildActivityWatchEvent({
       provider,
       event_type: data.event_type,
+      turn_link_id: data.turn_link_id,
       source_event_id: data.source_event_id,
       occurred_at: data.occurred_at,
       observed_at: data.observed_at,

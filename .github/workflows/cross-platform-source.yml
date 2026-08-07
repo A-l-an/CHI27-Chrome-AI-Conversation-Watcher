@@ -12,6 +12,10 @@ jobs:
   validate-and-package:
     name: Validate and package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      CHI27_ARTIFACT_REPOSITORY: ${{ github.repository }}
+      CHI27_ARTIFACT_SOURCE_COMMIT: ${{ github.sha }}
+      CHI27_ARTIFACT_RELEASE_STAGE: source_validation
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +37,8 @@ jobs:
         run: npm test
       - name: Build deterministic unpacked-extension artifact
         run: npm run package
+      - name: Verify unpacked-extension artifact contract
+        run: npm run verify:package
       - name: Upload unpacked-extension source artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

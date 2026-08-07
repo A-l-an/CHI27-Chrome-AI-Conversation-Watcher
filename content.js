@@ -47,6 +47,7 @@
     return Core.buildActivityWatchEvent({
       provider,
       event_type: descriptor.event_type,
+      turn_link_id: descriptor.turn_link_id,
       occurred_at: new Date(descriptor.at || Date.now()).toISOString(),
       conversation: eventContext.identity,
       confidence: descriptor.confidence,

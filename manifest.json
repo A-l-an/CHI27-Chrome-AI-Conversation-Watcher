@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CHI27 AI Conversation Watcher",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Content-free ActivityWatch events with ephemeral response previews in local tracker notifications.",
   "permissions": [
     "alarms",

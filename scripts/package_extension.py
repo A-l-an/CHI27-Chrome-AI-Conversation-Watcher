@@ -7,14 +7,22 @@ import argparse
 import hashlib
 import html.parser
 import json
+import os
+import platform
 import re
+import subprocess
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
+from typing import Optional
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
+CANONICAL_REPOSITORY = "A-l-an/CHI27-Chrome-AI-Conversation-Watcher"
+RELEASE_STAGES = {"local_validation", "source_validation"}
+PLATFORMS = {"Windows", "macOS", "Linux"}
+ARCHITECTURES = {"X64", "ARM64", "X86", "ARM"}
 FORBIDDEN_NAMES = {
     ".env",
     "participant_config.json",
@@ -26,6 +34,124 @@ URL_PREFIXES = ("data:", "http:", "https:", "chrome:", "#", "//")
 
 class PackageError(RuntimeError):
     pass
+
+
+def current_git_head() -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    candidate = result.stdout.strip().lower()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", candidate):
+        raise PackageError(
+            "source commit is unavailable; set CHI27_ARTIFACT_SOURCE_COMMIT"
+        )
+    return candidate
+
+
+def local_platform() -> str:
+    candidate = {
+        "Darwin": "macOS",
+        "Windows": "Windows",
+        "Linux": "Linux",
+    }.get(platform.system())
+    if candidate is None:
+        raise PackageError("local platform is unsupported")
+    return candidate
+
+
+def local_architecture() -> str:
+    candidate = {
+        "x86_64": "X64",
+        "amd64": "X64",
+        "arm64": "ARM64",
+        "aarch64": "ARM64",
+        "x86": "X86",
+        "i386": "X86",
+        "i686": "X86",
+        "arm": "ARM",
+    }.get(platform.machine().lower())
+    if candidate is None:
+        raise PackageError("local architecture is unsupported")
+    return candidate
+
+
+def validate_artifact_metadata(metadata: dict[str, str]) -> dict[str, str]:
+    required = {
+        "repository",
+        "source_commit",
+        "platform",
+        "architecture",
+        "release_stage",
+    }
+    if set(metadata) != required:
+        raise PackageError("artifact metadata must use the closed release schema")
+    normalized = {
+        key: value.strip() if isinstance(value, str) else ""
+        for key, value in metadata.items()
+    }
+    if normalized["repository"] != CANONICAL_REPOSITORY:
+        raise PackageError("artifact repository does not match the canonical repository")
+    normalized["source_commit"] = normalized["source_commit"].lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", normalized["source_commit"]):
+        raise PackageError("artifact source commit must be a full Git SHA")
+    if normalized["platform"] not in PLATFORMS:
+        raise PackageError("artifact platform is unsupported")
+    if normalized["architecture"] not in ARCHITECTURES:
+        raise PackageError("artifact architecture is unsupported")
+    if normalized["release_stage"] not in RELEASE_STAGES:
+        raise PackageError("artifact release stage is unsupported")
+    if (
+        normalized["release_stage"] == "source_validation"
+        and normalized["platform"] not in {"Windows", "macOS"}
+    ):
+        raise PackageError("source-validation artifacts require a workflow platform")
+    return normalized
+
+
+def resolve_artifact_metadata(
+    repository: Optional[str] = None,
+    source_commit: Optional[str] = None,
+    target_platform: Optional[str] = None,
+    architecture: Optional[str] = None,
+    release_stage: Optional[str] = None,
+) -> dict[str, str]:
+    github_actions = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+    metadata = {
+        "repository": (
+            repository
+            or os.environ.get("CHI27_ARTIFACT_REPOSITORY")
+            or os.environ.get("GITHUB_REPOSITORY")
+            or CANONICAL_REPOSITORY
+        ),
+        "source_commit": (
+            source_commit
+            or os.environ.get("CHI27_ARTIFACT_SOURCE_COMMIT")
+            or os.environ.get("GITHUB_SHA")
+            or current_git_head()
+        ),
+        "platform": (
+            target_platform
+            or os.environ.get("CHI27_ARTIFACT_PLATFORM")
+            or os.environ.get("RUNNER_OS")
+            or local_platform()
+        ),
+        "architecture": (
+            architecture
+            or os.environ.get("CHI27_ARTIFACT_ARCHITECTURE")
+            or os.environ.get("RUNNER_ARCH")
+            or local_architecture()
+        ),
+        "release_stage": (
+            release_stage
+            or os.environ.get("CHI27_ARTIFACT_RELEASE_STAGE")
+            or ("source_validation" if github_actions else "local_validation")
+        ),
+    }
+    return validate_artifact_metadata(metadata)
 
 
 class AssetParser(html.parser.HTMLParser):
@@ -65,7 +191,7 @@ def clean_reference(value: str, base: PurePosixPath = PurePosixPath(".")) -> Pur
     return result
 
 
-def add_manifest_paths(manifest: dict, add) -> None:
+def add_manifest_paths(manifest: dict, add, root: Path = ROOT) -> None:
     background = manifest.get("background", {})
     if isinstance(background, dict):
         if isinstance(background.get("service_worker"), str):
@@ -110,12 +236,12 @@ def add_manifest_paths(manifest: dict, add) -> None:
             clean = clean_reference(pattern)
             if clean is None:
                 continue
-            matches = sorted(ROOT.glob(clean.as_posix()))
+            matches = sorted(root.glob(clean.as_posix()))
             if not matches:
                 raise PackageError(f"web-accessible pattern matched nothing: {pattern}")
             for match in matches:
                 if match.is_file():
-                    add(match.relative_to(ROOT).as_posix())
+                    add(match.relative_to(root).as_posix())
 
 
 def referenced_assets(relative: PurePosixPath, payload: str) -> set[PurePosixPath]:
@@ -145,8 +271,9 @@ def referenced_assets(relative: PurePosixPath, payload: str) -> set[PurePosixPat
     return found
 
 
-def build_closure() -> list[PurePosixPath]:
-    manifest_path = ROOT / "manifest.json"
+def build_closure(root: Path = ROOT) -> list[PurePosixPath]:
+    root = root.resolve()
+    manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     pending: list[PurePosixPath] = []
     included: set[PurePosixPath] = set()
@@ -157,10 +284,10 @@ def build_closure() -> list[PurePosixPath]:
             pending.append(clean)
 
     add("manifest.json")
-    add_manifest_paths(manifest, add)
+    add_manifest_paths(manifest, add, root)
     while pending:
         relative = pending.pop(0)
-        source = ROOT / Path(relative.as_posix())
+        source = root / Path(relative.as_posix())
         if not source.exists() or not source.is_file():
             raise PackageError(f"referenced file is missing: {relative}")
         if source.is_symlink():
@@ -175,11 +302,19 @@ def build_closure() -> list[PurePosixPath]:
     return sorted(included, key=lambda item: item.as_posix())
 
 
-def package(output_dir: Path) -> tuple[Path, Path, Path]:
+def package(
+    output_dir: Path,
+    artifact_metadata: Optional[dict[str, str]] = None,
+) -> tuple[Path, Path, Path]:
     manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
     version = manifest.get("version")
     if not isinstance(version, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", version):
         raise PackageError("manifest version is invalid")
+    metadata = validate_artifact_metadata(
+        artifact_metadata
+        if artifact_metadata is not None
+        else resolve_artifact_metadata()
+    )
     files = build_closure()
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"CHI27-Chrome-AI-Conversation-Watcher-{version}-unpacked-extension"
@@ -194,28 +329,37 @@ def package(output_dir: Path) -> tuple[Path, Path, Path]:
             handle.writestr(info, (ROOT / Path(relative.as_posix())).read_bytes())
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     sidecar = output_dir / f"{stem}.sha256"
-    sidecar.write_text(f"{digest}  {archive.name}\n", encoding="utf-8", newline="\n")
+    sidecar.write_bytes(f"{digest}  {archive.name}\n".encode("utf-8"))
     provenance = json.loads((ROOT / "SOURCE_PROVENANCE.json").read_text(encoding="utf-8"))
     build_manifest = output_dir / f"{stem}.manifest.json"
-    build_manifest.write_text(
+    build_manifest.write_bytes(
         json.dumps(
             {
-                "schema_version": "1.0",
+                "schema_version": "1.1",
                 "artifact_kind": "unpacked_extension_source",
                 "archive": archive.name,
                 "sha256": digest,
+                "repository": metadata["repository"],
+                "source_commit": metadata["source_commit"],
+                "platform": metadata["platform"],
+                "architecture": metadata["architecture"],
+                "version": version,
                 "extension_version": version,
-                "source_commit": provenance["source_commit"],
-                "source_tree": provenance["source_tree"],
+                "contains_research_data": False,
+                "release_stage": metadata["release_stage"],
+                "platform_target": "chrome_mv3",
+                "provenance": {
+                    "source_repository": provenance["source_repository"],
+                    "source_commit": provenance["source_commit"],
+                    "source_tree": provenance["source_tree"],
+                },
                 "file_count": len(files),
                 "files": [item.as_posix() for item in files],
             },
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
-        ) + "\n",
-        encoding="utf-8",
-        newline="\n",
+        ).encode("utf-8") + b"\n",
     )
     return archive, sidecar, build_manifest
 
@@ -223,9 +367,24 @@ def package(output_dir: Path) -> tuple[Path, Path, Path]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, default=ROOT / "dist")
+    parser.add_argument("--repository")
+    parser.add_argument("--source-commit")
+    parser.add_argument("--platform", dest="target_platform")
+    parser.add_argument("--architecture")
+    parser.add_argument("--release-stage")
     args = parser.parse_args()
     try:
-        archive, sidecar, build_manifest = package(args.output_dir.resolve())
+        metadata = resolve_artifact_metadata(
+            repository=args.repository,
+            source_commit=args.source_commit,
+            target_platform=args.target_platform,
+            architecture=args.architecture,
+            release_stage=args.release_stage,
+        )
+        archive, sidecar, build_manifest = package(
+            args.output_dir.resolve(),
+            metadata,
+        )
     except (OSError, ValueError, PackageError, json.JSONDecodeError) as error:
         print(f"package failed: {error}", file=sys.stderr)
         return 1

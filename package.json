@@ -1,6 +1,6 @@
 {
   "name": "chi27-chrome-ai-conversation-watcher",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "private": true,
   "description": "Dependency-free tests for the CHI27 Chrome AI conversation watcher.",
   "scripts": {
@@ -8,6 +8,7 @@
     "test:node": "node --test tests/*.test.js",
     "test:python": "python tests/event_link_id_golden_test.py",
     "test:package": "python tests/package_extension_test.py",
-    "package": "python scripts/package_extension.py"
+    "package": "python scripts/package_extension.py",
+    "verify:package": "python scripts/verify_extension_artifact.py --artifact-dir dist"
   }
 }

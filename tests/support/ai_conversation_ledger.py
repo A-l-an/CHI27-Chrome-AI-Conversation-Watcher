@@ -38,7 +38,25 @@ from capture_window import (  # noqa: E402
 )
 
 
+# The support ledger keeps its stable de-identified output contract at 1.0,
+# while dual-reading both producer schemas during the 1.1 turn-link rollout.
 SCHEMA_VERSION = "1.0"
+SUPPORTED_SOURCE_SCHEMA_VERSIONS = frozenset({"1.0", "1.1"})
+TURN_LINK_SOURCE_SCHEMA_VERSION = "1.1"
+TURN_LINK_EVENT_TYPES = frozenset(
+    {
+        "prompt_submitted",
+        "assistant_response_started",
+        "assistant_response_completed",
+        "assistant_response_failed",
+        "assistant_response_cancelled",
+    }
+)
+TURN_LINK_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 AI_BUCKET_PREFIXES = (
     "aw-watcher-ai-conversation",
     "aw-watcher-ai-chat",
@@ -150,12 +168,14 @@ SURFACE_ALIASES = {
 REASON_CODE_VALUES = {
     # 08 Chrome adapter.
     "identity_bound_to_existing_conversation",
+    "new_submission_before_previous_terminal",
     "navigation_while_response_in_progress",
     "provider_error_control",
     "provider_error_control_visible",
     "required_composer_missing",
     "required_composer_or_send_control_missing",
     "response_completed_while_hidden",
+    "response_active_scope_unverified",
     "response_start_signal_timeout",
     "route_identity_resolution_failed",
     "notification_timeout",
@@ -187,7 +207,10 @@ SAFE_METADATA_ENUMS = {
         "stop_control_disappeared",
         "stop_control_disappeared_after_settle",
     },
-    "generation_state": {"response_in_progress_at_navigation"},
+    "generation_state": {
+        "response_in_progress_at_navigation",
+        "response_observation_incomplete_at_new_submission",
+    },
     "reason_code": REASON_CODE_VALUES,
     "error_code": {
         "identity_not_exact",
@@ -700,7 +723,11 @@ def bucket_is_candidate(bucket_id, bucket):
         return True
     for event in (bucket.get("events") or [])[:5]:
         data = event.get("data") if isinstance(event, dict) else None
-        if isinstance(data, dict) and data.get("schema_version") == SCHEMA_VERSION:
+        if (
+            isinstance(data, dict)
+            and str(data.get("schema_version"))
+            in SUPPORTED_SOURCE_SCHEMA_VERSIONS
+        ):
             if data.get("source_event_id") and data.get("event_type") and data.get("provider"):
                 return True
     return False
@@ -846,7 +873,8 @@ def normalize_event(outer, index):
     missing = [field for field in required if data.get(field) in (None, "")]
     if missing:
         return None, "event_%d:missing_%s" % (index, "_".join(missing))
-    if str(data.get("schema_version")) != SCHEMA_VERSION:
+    source_schema_version = str(data.get("schema_version"))
+    if source_schema_version not in SUPPORTED_SOURCE_SCHEMA_VERSIONS:
         return None, "event_%d:unsupported_schema" % index
     occurred_at = parse_time(data.get("occurred_at"))
     observed_at = parse_time(data.get("observed_at"))
@@ -855,6 +883,18 @@ def normalize_event(outer, index):
         return None, "event_%d:invalid_timestamp" % index
     event_type = canonical_token(data.get("event_type"))
     event_type = EVENT_ALIASES.get(event_type, event_type)
+    turn_link_id = str(data.get("turn_link_id") or "").strip()
+    turn_link_present = "turn_link_id" in data
+    if source_schema_version == TURN_LINK_SOURCE_SCHEMA_VERSION:
+        if event_type in TURN_LINK_EVENT_TYPES:
+            if not TURN_LINK_PATTERN.fullmatch(turn_link_id):
+                return None, "event_%d:missing_or_invalid_turn_link" % index
+        elif turn_link_present:
+            return None, "event_%d:turn_link_forbidden_for_event_type" % index
+    elif turn_link_present:
+        # Schema 1.0 never defined a link field. Treat an apparent hybrid as
+        # invalid instead of silently granting it 1.1 pairing semantics.
+        return None, "event_%d:turn_link_forbidden_for_schema" % index
     provider = canonical_token(data.get("provider"))
     provider = PROVIDER_ALIASES.get(provider, provider)
     surface = canonical_token(data.get("surface"))
@@ -874,7 +914,11 @@ def normalize_event(outer, index):
         duration = 0.0
     normalized = {
         "schema_version": SCHEMA_VERSION,
+        "source_schema_version": source_schema_version,
         "source_event_id_raw": str(data.get("source_event_id")).strip(),
+        # Private validation-only linkage. It is hashed for turn_id and never
+        # projected into regular event/CSV outputs.
+        "turn_link_id_raw": turn_link_id,
         "occurred_dt": occurred_at,
         "observed_dt": observed_at,
         "outer_dt": outer_time,
@@ -1338,10 +1382,92 @@ def derive_return_events(events, visits):
     return derived
 
 
+def validate_turn_links(events):
+    """Validate 1.1 linkage without exposing the raw UUID in any issue."""
+    grouped = defaultdict(list)
+    for event in events:
+        if (
+            event["source_schema_version"] == TURN_LINK_SOURCE_SCHEMA_VERSION
+            and event["event_type"] in TURN_LINK_EVENT_TYPES
+        ):
+            grouped[event["turn_link_id_raw"]].append(event)
+
+    issues = []
+    terminal_types = set(RESPONSE_TERMINAL_EVENTS)
+    for group in grouped.values():
+        identities = {
+            (event["provider"], event["canonical_key_raw"], event["surface"])
+            for event in group
+        }
+        if len(identities) != 1:
+            issues.append("turn_link_identity_conflict")
+
+        prompts = [event for event in group if event["event_type"] == "prompt_submitted"]
+        starts = [
+            event
+            for event in group
+            if event["event_type"] == "assistant_response_started"
+        ]
+        terminals = [event for event in group if event["event_type"] in terminal_types]
+        if len(prompts) > 1:
+            issues.append("turn_link_multiple_prompts")
+        if len(starts) > 1:
+            issues.append("turn_link_multiple_starts")
+        if len(terminals) > 1:
+            issues.append("turn_link_multiple_terminals")
+        if (
+            terminals
+            and not starts
+            and (
+                not prompts
+                or any(
+                    event["event_type"] != "assistant_response_cancelled"
+                    for event in terminals
+                )
+            )
+        ):
+            issues.append("turn_link_terminal_without_start")
+
+        prompt_dt = prompts[0]["occurred_dt"] if prompts else None
+        start_dt = starts[0]["occurred_dt"] if starts else None
+        terminal_dt = terminals[0]["occurred_dt"] if terminals else None
+        if (
+            prompt_dt is not None
+            and start_dt is not None
+            and start_dt < prompt_dt
+        ) or (
+            prompt_dt is not None
+            and terminal_dt is not None
+            and terminal_dt < prompt_dt
+        ) or (
+            start_dt is not None
+            and terminal_dt is not None
+            and terminal_dt < start_dt
+        ):
+            issues.append("turn_link_lifecycle_order_invalid")
+    return issues
+
+
 def derive_turns(events, window_start=None, window_end=None):
     latest_input = {}
-    pending = defaultdict(deque)
+    legacy_pending = defaultdict(deque)
+    linked_turns = {}
     turns = []
+
+    def new_turn(event, turn_link_id=""):
+        return {
+            "provider": event["provider"],
+            "surface": event["surface"],
+            "raw_key": event["canonical_key_raw"],
+            "turn_link_id_raw": turn_link_id,
+            "input_event": None,
+            "submit_event": None,
+            "response_started_event": None,
+            "response_event": None,
+            "outcome": "",
+            "first_event_dt": event["occurred_dt"],
+        }
+
     for event in events:
         raw_key = event["canonical_key_raw"]
         if not raw_key or event["event_type"] in SOURCE_EVENT_TYPES:
@@ -1351,9 +1477,34 @@ def derive_turns(events, window_start=None, window_end=None):
         if event_type == "input_started":
             latest_input[key] = event
             continue
+
+        turn_link_id = event.get("turn_link_id_raw", "")
+        if (
+            event["source_schema_version"] == TURN_LINK_SOURCE_SCHEMA_VERSION
+            and event_type in TURN_LINK_EVENT_TYPES
+            and turn_link_id
+        ):
+            turn = linked_turns.get(turn_link_id)
+            if turn is None:
+                turn = new_turn(event, turn_link_id)
+                linked_turns[turn_link_id] = turn
+            if event_type == "prompt_submitted":
+                if turn["submit_event"] is None:
+                    turn["input_event"] = latest_input.pop(key, None)
+                    turn["submit_event"] = event
+                continue
+            if event_type == "assistant_response_started":
+                if turn["response_started_event"] is None:
+                    turn["response_started_event"] = event
+                continue
+            if event_type in RESPONSE_TERMINAL_EVENTS:
+                if turn["response_event"] is None:
+                    turn["response_event"] = event
+                continue
+
         if event_type == "prompt_submitted":
             input_event = latest_input.pop(key, None)
-            pending[key].append(
+            legacy_pending[key].append(
                 {
                     "provider": event["provider"],
                     "surface": event["surface"],
@@ -1363,30 +1514,23 @@ def derive_turns(events, window_start=None, window_end=None):
                     "response_started_event": None,
                     "response_event": None,
                     "outcome": "",
+                    "turn_link_id_raw": "",
+                    "first_event_dt": event["occurred_dt"],
                 }
             )
             continue
-        if event_type == "assistant_response_started" and pending[key]:
-            if pending[key][0]["response_started_event"] is None:
-                pending[key][0]["response_started_event"] = event
+        if event_type == "assistant_response_started" and legacy_pending[key]:
+            if legacy_pending[key][0]["response_started_event"] is None:
+                legacy_pending[key][0]["response_started_event"] = event
             continue
         if event_type in RESPONSE_TERMINAL_EVENTS:
-            if pending[key]:
-                turn = pending[key].popleft()
+            if legacy_pending[key]:
+                turn = legacy_pending[key].popleft()
             else:
-                turn = {
-                    "provider": event["provider"],
-                    "surface": event["surface"],
-                    "raw_key": raw_key,
-                    "input_event": None,
-                    "submit_event": None,
-                    "response_started_event": None,
-                    "response_event": None,
-                    "outcome": "",
-                    "window_boundary_status": (
-                        "left_censored" if window_start is not None else "inside"
-                    ),
-                }
+                turn = new_turn(event)
+                turn["window_boundary_status"] = (
+                    "left_censored" if window_start is not None else "inside"
+                )
             turn["response_event"] = event
             outcome = RESPONSE_TERMINAL_EVENTS[event_type]
             if turn["submit_event"]:
@@ -1397,7 +1541,35 @@ def derive_turns(events, window_start=None, window_end=None):
             else:
                 turn["outcome"] = "orphan_" + outcome
             turns.append(turn)
-    for queue in pending.values():
+
+    for turn in linked_turns.values():
+        submit = turn["submit_event"]
+        response = turn["response_event"]
+        if response is not None:
+            outcome = RESPONSE_TERMINAL_EVENTS[response["event_type"]]
+            if submit is not None:
+                turn["outcome"] = outcome
+                turn["window_boundary_status"] = "inside"
+            else:
+                # A schema-1.1 start without a prompt is emitted only as an
+                # explicit left-censored lifecycle; preserve that evidence.
+                turn["outcome"] = "left_censored_" + outcome
+                turn["window_boundary_status"] = "left_censored"
+        elif submit is not None:
+            if window_end is not None:
+                turn["outcome"] = "right_censored"
+                turn["window_boundary_status"] = "right_censored"
+            else:
+                turn["outcome"] = "missing_response"
+                turn["window_boundary_status"] = "inside"
+        else:
+            turn["outcome"] = "left_censored_missing_response"
+            turn["window_boundary_status"] = (
+                "both_censored" if window_end is not None else "left_censored"
+            )
+        turns.append(turn)
+
+    for queue in legacy_pending.values():
         while queue:
             turn = queue.popleft()
             if window_end is not None:
@@ -1421,7 +1593,10 @@ def derive_turns(events, window_start=None, window_end=None):
         if submitted_dt and response_dt:
             latency = "%.3f" % max(0.0, (response_dt - submitted_dt).total_seconds())
         safe_key = safe_hash("conv", turn["provider"], turn["raw_key"])
-        anchor_id = anchor["source_event_id_raw"] if anchor else turn["outcome"]
+        anchor_id = (
+            turn.get("turn_link_id_raw")
+            or (anchor["source_event_id_raw"] if anchor else turn["outcome"])
+        )
         rows.append(
             {
                 "turn_id": safe_hash("turn", turn["provider"], turn["raw_key"], anchor_id),
@@ -1784,6 +1959,7 @@ def assess_health(
     duplicate_count,
     conflict_count,
     alias_issues,
+    turn_link_issues,
     observation_end,
     observation_end_source,
     max_gap_sec,
@@ -1839,7 +2015,7 @@ def assess_health(
             if status == "healthy":
                 status = "degraded"
             gaps.append("tracker_internal_gap_exceeds_threshold")
-        if invalid_messages or conflict_count or alias_issues:
+        if invalid_messages or conflict_count or alias_issues or turn_link_issues:
             if status == "healthy":
                 status = "degraded"
             gaps.append("invalid_or_conflicting_events_present")
@@ -1877,6 +2053,7 @@ def assess_health(
         "duplicate_event_count": duplicate_count,
         "conflicting_duplicate_count": conflict_count,
         "alias_issue_count": len(alias_issues),
+        "turn_link_issue_count": len(turn_link_issues),
         "liveness_event_count": len(liveness),
         "unrecovered_adapter_count": unrecovered_adapters,
         "latest_source_observed_at": iso(latest_source) if latest_source else None,
@@ -1889,7 +2066,12 @@ def assess_health(
         "health_gaps": sorted(set(gaps)),
         "warnings": sorted(set(warnings)),
         "validation_issue_codes": sorted(
-            set(invalid_messages + alias_issues + sanitization_issues)
+            set(
+                invalid_messages
+                + alias_issues
+                + turn_link_issues
+                + sanitization_issues
+            )
         ),
         "privacy": {
             "regular_outputs_contain_full_urls": False,
@@ -2393,6 +2575,7 @@ def main(argv=None):
         )
     )
     alias_issues = resolve_aliases(normalized)
+    turn_link_issues = validate_turn_links(normalized)
     health = assess_health(
         source_present,
         source_event_count,
@@ -2402,6 +2585,7 @@ def main(argv=None):
         duplicate_count,
         conflict_count,
         alias_issues,
+        turn_link_issues,
         observation_end,
         observation_end_source,
         args.max_source_gap_sec,
