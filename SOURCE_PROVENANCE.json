@@ -6,7 +6,7 @@
   "source_commit": "dbfcf631ad838af1b104f18903d32303aa1e5e1f",
   "source_path": "01 Projects/CHI27 - Attention Modeling/03 Study Design/Version-C_Platform/08_Chrome-AI-Conversation-Watcher",
   "source_tree": "af318f523db7f53c960b91d4ee621987cc0ddcc0",
-  "product_version": "0.2.9",
+  "product_version": "0.2.11",
   "support_files": [
     {
       "destination": "tests/support/ai_conversation_ledger.py",

@@ -56,7 +56,7 @@ test("canonical v1 event names include health, lifecycle, turn, return, and enga
   ]);
 });
 
-test("suppressed lifecycle accepts only gate plus one fixed reason code", () => {
+test("suppressed lifecycle accepts only gate, completion visibility, and one fixed reason code", () => {
   const base = {
     provider: "claude",
     event_type: "tracker_notification_suppressed",
@@ -71,13 +71,17 @@ test("suppressed lifecycle accepts only gate plus one fixed reason code", () => 
   for (const reasonCode of [
     "notifications_disabled",
     "study_session_inactive",
-    "response_session_not_authorized",
-    "response_completed_while_foreground"
+    "response_session_not_authorized"
   ]) {
     const event = buildActivityWatchEvent(Object.assign({}, base, {
-      metadata: { phase: "gate", reason_code: reasonCode }
+      metadata: {
+        completion_visibility: "foreground",
+        phase: "gate",
+        reason_code: reasonCode
+      }
     }));
     assert.deepEqual(event.data.metadata, {
+      completion_visibility: "foreground",
       phase: "gate",
       reason_code: reasonCode
     });
@@ -85,6 +89,7 @@ test("suppressed lifecycle accepts only gate plus one fixed reason code", () => 
   assert.throws(
     () => buildActivityWatchEvent(Object.assign({}, base, {
       metadata: {
+        completion_visibility: "foreground",
         phase: "gate",
         reason_code: "SYNTHETIC_SECRET",
         notification_id: "chi27-ai-private"
@@ -92,6 +97,78 @@ test("suppressed lifecycle accepts only gate plus one fixed reason code", () => 
     })),
     /Invalid tracker_notification_suppressed metadata/
   );
+});
+
+test("legacy completion and notification shapes remain sanitizer-compatible", () => {
+  const conversation = {
+    conversation_key: "a".repeat(64),
+    identity_status: "exact",
+    namespace_generation: 1,
+    namespace_fingerprint: "fixture-namespace-fingerprint"
+  };
+  const legacyCompleted = buildActivityWatchEvent({
+    provider: "chatgpt",
+    event_type: "assistant_response_completed",
+    turn_link_id: TURN_LINK_ID,
+    conversation,
+    confidence: "derived",
+    source_adapter: "chatgpt-dom-v1",
+    metadata: {
+      completion_signal: "stop_control_disappeared_after_settle",
+      state_transition: "responding_to_completed"
+    }
+  });
+  assert.ok(sanitizePersistedActivityWatchEvent(legacyCompleted));
+
+  const legacyForegroundSuppressed = buildActivityWatchEvent({
+    provider: "chatgpt",
+    event_type: "tracker_notification_suppressed",
+    conversation,
+    confidence: "exact",
+    source_adapter: "chrome-background-notification-v2",
+    metadata: {
+      phase: "gate",
+      reason_code: "response_completed_while_foreground"
+    }
+  });
+  assert.ok(sanitizePersistedActivityWatchEvent(legacyForegroundSuppressed));
+
+  const legacyHiddenAttempted = buildActivityWatchEvent({
+    provider: "chatgpt",
+    event_type: "tracker_notification_attempted",
+    conversation,
+    confidence: "exact",
+    source_adapter: "chrome-background-notification-v2",
+    metadata: {
+      phase: "create",
+      reason_code: "response_completed_while_hidden"
+    }
+  });
+  assert.ok(sanitizePersistedActivityWatchEvent(legacyHiddenAttempted));
+
+  const impossibleLegacyForegroundAttempted = structuredClone(
+    legacyHiddenAttempted
+  );
+  impossibleLegacyForegroundAttempted.data.metadata.reason_code =
+    "response_completed_while_foreground";
+  assert.equal(
+    sanitizePersistedActivityWatchEvent(impossibleLegacyForegroundAttempted),
+    null
+  );
+
+  const currentForegroundAttempted = buildActivityWatchEvent({
+    provider: "chatgpt",
+    event_type: "tracker_notification_attempted",
+    conversation,
+    confidence: "exact",
+    source_adapter: "chrome-background-notification-v2",
+    metadata: {
+      completion_visibility: "foreground",
+      phase: "create",
+      reason_code: "response_completed_while_foreground"
+    }
+  });
+  assert.ok(sanitizePersistedActivityWatchEvent(currentForegroundAttempted));
 });
 
 test("ActivityWatch outer event and data contract are complete and content-free", () => {
@@ -145,6 +222,7 @@ test("auto-cleared lifecycle keeps only timeout metadata and rejects sensitive a
     confidence: "exact",
     source_adapter: "chrome-background-notification-v2",
     metadata: {
+      completion_visibility: "background",
       phase: "clear",
       reason_code: "notification_timeout",
       timeout_seconds: 20,
@@ -154,6 +232,7 @@ test("auto-cleared lifecycle keeps only timeout metadata and rejects sensitive a
     }
   });
   assert.deepEqual(event.data.metadata, {
+    completion_visibility: "background",
     phase: "clear",
     reason_code: "notification_timeout",
     timeout_seconds: 20

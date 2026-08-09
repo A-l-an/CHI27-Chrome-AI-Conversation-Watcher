@@ -214,22 +214,22 @@
         case "RESPONSE_COMPLETED":
           if (observationMatches() && this.responding) {
             const turnLinkId = this.activeTurnLinkId;
+            const completionVisibility = this.foreground
+              ? "foreground"
+              : "background";
             clearResponseObservation();
             emit("assistant_response_completed", action.confidence || "derived", {
               completion_signal: action.signal || "stop_control_disappeared",
+              completion_visibility: completionVisibility,
               state_transition: "responding_to_completed"
             }, turnLinkId);
-            if (!this.foreground) {
-              effects.push({
-                type: "SHOW_TRACKER_NOTIFICATION",
-                reason_code: "response_completed_while_hidden"
-              });
-            } else {
-              effects.push({
-                type: "AUDIT_TRACKER_NOTIFICATION_SUPPRESSED",
-                reason_code: "response_completed_while_foreground"
-              });
-            }
+            effects.push({
+              type: "SHOW_TRACKER_NOTIFICATION",
+              reason_code: this.foreground
+                ? "response_completed_while_foreground"
+                : "response_completed_while_hidden",
+              completion_visibility: completionVisibility
+            });
           }
           break;
         case "RESPONSE_FAILED":

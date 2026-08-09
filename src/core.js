@@ -69,6 +69,7 @@
     "adapter_health",
     "action",
     "completion_signal",
+    "completion_visibility",
     "error_code",
     "focus_succeeded",
     "observation_gap",
@@ -85,8 +86,15 @@
     "notifications_disabled",
     "study_session_inactive",
     "response_session_not_authorized",
+    // Read-only compatibility for queued 0.2.7 lifecycle events. The current
+    // state machine never emits foreground completion as a suppression gate.
     "response_completed_while_foreground"
   ]);
+  const NOTIFICATION_COMPLETION_REASON_CODES = new Set([
+    "response_completed_while_hidden",
+    "response_completed_while_foreground"
+  ]);
+  const COMPLETION_VISIBILITIES = new Set(["background", "foreground"]);
   const SOURCE_EVENT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   const EXACT_CONVERSATION_KEY_RE = /^[0-9a-f]{64}$/;
@@ -142,6 +150,7 @@
         "stop_control_disappeared",
         "stop_control_disappeared_after_settle"
       ]),
+      completion_visibility: COMPLETION_VISIBILITIES,
       state_transition: new Set(["responding_to_completed"])
     }),
     assistant_response_failed: Object.freeze({
@@ -156,18 +165,22 @@
       state_transition: new Set(["responding_to_cancelled"])
     }),
     tracker_notification_suppressed: Object.freeze({
+      completion_visibility: COMPLETION_VISIBILITIES,
       phase: new Set(["gate"]),
       reason_code: NOTIFICATION_SUPPRESSION_REASON_CODES
     }),
     tracker_notification_attempted: Object.freeze({
+      completion_visibility: COMPLETION_VISIBILITIES,
       phase: new Set(["create"]),
-      reason_code: new Set(["response_completed_while_hidden"])
+      reason_code: NOTIFICATION_COMPLETION_REASON_CODES
     }),
     tracker_notification_created: Object.freeze({
+      completion_visibility: COMPLETION_VISIBILITIES,
       phase: new Set(["create"]),
-      reason_code: new Set(["response_completed_while_hidden"])
+      reason_code: NOTIFICATION_COMPLETION_REASON_CODES
     }),
     tracker_notification_failed: Object.freeze({
+      completion_visibility: COMPLETION_VISIBILITIES,
       phase: new Set(["validate_context", "permission", "store_target", "create"]),
       error_code: new Set([
         "identity_not_exact",
@@ -179,6 +192,7 @@
       ])
     }),
     tracker_notification_clicked: Object.freeze({
+      completion_visibility: COMPLETION_VISIBILITIES,
       phase: new Set(["focus"]),
       action: new Set([
         "activated_existing_tab",
@@ -188,13 +202,15 @@
       focus_succeeded: "boolean"
     }),
     tracker_notification_auto_cleared: Object.freeze({
+      completion_visibility: COMPLETION_VISIBILITIES,
       phase: new Set(["clear"]),
       reason_code: new Set(["notification_timeout"]),
       timeout_seconds: new Set([20])
     }),
     tracker_notification_shown: Object.freeze({
+      completion_visibility: COMPLETION_VISIBILITIES,
       phase: new Set(["create"]),
-      reason_code: new Set(["response_completed_while_hidden"])
+      reason_code: NOTIFICATION_COMPLETION_REASON_CODES
     }),
     user_interacted: Object.freeze({
       signal: new Set([
@@ -306,7 +322,8 @@
       type: "SHOW_TRACKER_NOTIFICATION",
       provider: config.provider,
       context: { identity: projectedIdentity },
-      reason_code: config.reason_code
+      reason_code: config.reason_code,
+      completion_visibility: config.completion_visibility
     };
     const notificationPreview = sanitizeEphemeralNotificationPreview(
       config.notification_preview
@@ -382,6 +399,83 @@
       keys.length === Object.keys(contract).length &&
       Object.keys(contract).every((key) => Object.hasOwn(metadata, key))
     );
+  }
+
+  function validLegacyPersistedMetadataForEvent(eventType, metadata) {
+    if (
+      !metadata ||
+      typeof metadata !== "object" ||
+      Array.isArray(metadata) ||
+      Object.hasOwn(metadata, "completion_visibility")
+    ) {
+      return false;
+    }
+    const hasExactKeys = (...expected) => {
+      const actual = Object.keys(metadata).sort();
+      return JSON.stringify(actual) === JSON.stringify(expected.slice().sort());
+    };
+    switch (eventType) {
+      case "assistant_response_completed":
+        return (
+          hasExactKeys("completion_signal", "state_transition") &&
+          METADATA_CONTRACTS.assistant_response_completed.completion_signal.has(
+            metadata.completion_signal
+          ) &&
+          metadata.state_transition === "responding_to_completed"
+        );
+      case "tracker_notification_suppressed":
+        return (
+          hasExactKeys("phase", "reason_code") &&
+          metadata.phase === "gate" &&
+          NOTIFICATION_SUPPRESSION_REASON_CODES.has(metadata.reason_code)
+        );
+      case "tracker_notification_attempted":
+      case "tracker_notification_created":
+      case "tracker_notification_shown":
+        return (
+          hasExactKeys("phase", "reason_code") &&
+          metadata.phase === "create" &&
+          metadata.reason_code === "response_completed_while_hidden"
+        );
+      case "tracker_notification_failed": {
+        if (!hasExactKeys("phase", "error_code")) {
+          return false;
+        }
+        const legacyFailurePairs = new Map([
+          ["validate_context", new Set(["identity_not_exact"])],
+          ["permission", new Set([
+            "notification_permission_check_failed",
+            "notification_permission_denied"
+          ])],
+          ["store_target", new Set(["notification_target_storage_failed"])],
+          ["create", new Set([
+            "notification_create_failed",
+            "notification_icon_load_failed"
+          ])]
+        ]);
+        return Boolean(
+          legacyFailurePairs.get(metadata.phase)?.has(metadata.error_code)
+        );
+      }
+      case "tracker_notification_clicked":
+        return (
+          hasExactKeys("phase", "action", "focus_succeeded") &&
+          metadata.phase === "focus" &&
+          METADATA_CONTRACTS.tracker_notification_clicked.action.has(
+            metadata.action
+          ) &&
+          typeof metadata.focus_succeeded === "boolean"
+        );
+      case "tracker_notification_auto_cleared":
+        return (
+          hasExactKeys("phase", "reason_code", "timeout_seconds") &&
+          metadata.phase === "clear" &&
+          metadata.reason_code === "notification_timeout" &&
+          metadata.timeout_seconds === 20
+        );
+      default:
+        return false;
+    }
   }
 
   function validNamespacePair(data, required) {
@@ -486,10 +580,20 @@
         typeof rawMetadata === "object" &&
         !Array.isArray(rawMetadata)
       ) ? Object.keys(rawMetadata).sort() : [];
+      const currentShape = (
+        rawKeys.length === 3 &&
+        rawKeys[0] === "completion_visibility" &&
+        rawKeys[1] === "phase" &&
+        rawKeys[2] === "reason_code" &&
+        COMPLETION_VISIBILITIES.has(metadata.completion_visibility)
+      );
+      const legacyQueuedShape = (
+        rawKeys.length === 2 &&
+        rawKeys[0] === "phase" &&
+        rawKeys[1] === "reason_code"
+      );
       if (
-        rawKeys.length !== 2 ||
-        rawKeys[0] !== "phase" ||
-        rawKeys[1] !== "reason_code" ||
+        (!currentShape && !legacyQueuedShape) ||
         metadata.phase !== "gate" ||
         !NOTIFICATION_SUPPRESSION_REASON_CODES.has(metadata.reason_code)
       ) {
@@ -499,6 +603,9 @@
         phase: "gate",
         reason_code: metadata.reason_code
       };
+      if (currentShape) {
+        metadata.completion_visibility = input.metadata.completion_visibility;
+      }
     }
     if (
       input.provider === "claude" &&
@@ -609,7 +716,10 @@
     if (!validClosedEventData(data)) {
       return null;
     }
-    if (!validMetadataForEvent(data.event_type, data.metadata, true)) {
+    if (
+      !validMetadataForEvent(data.event_type, data.metadata, true) &&
+      !validLegacyPersistedMetadataForEvent(data.event_type, data.metadata)
+    ) {
       return null;
     }
     try {

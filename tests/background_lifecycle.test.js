@@ -498,7 +498,25 @@ function createBackgroundHarness(fetchImpl, options = {}) {
           }
         };
       }
-      return fetchImpl(call);
+      const response = await fetchImpl(call);
+      if (
+        call.method === "GET" &&
+        call.url.endsWith("/api/0/buckets/") &&
+        response &&
+        typeof response.json !== "function"
+      ) {
+        response.json = async () => ({
+          "aw-watcher-window_fixture": {
+            type: "currentwindow",
+            last_updated: new Date(clock.now()).toISOString()
+          },
+          "aw-watcher-web_fixture": {
+            type: "web.tab.current",
+            last_updated: new Date(clock.now()).toISOString()
+          }
+        });
+      }
+      return response;
     },
     setTimeout: clock.setTimeout
   });
@@ -1003,6 +1021,7 @@ const NOTIFICATION_REQUEST = {
     }
   },
   reason_code: "response_completed_while_hidden",
+  completion_visibility: "background",
   notification_preview: NOTIFICATION_PREVIEW_CANARY
 };
 const EXTENSION_PAGE_SENDER = {
@@ -1054,6 +1073,7 @@ function responseLifecycleEvent(
     },
     assistant_response_completed: {
       completion_signal: "stop_control_disappeared",
+      completion_visibility: request.completion_visibility,
       state_transition: "responding_to_completed"
     },
     assistant_response_failed: {
@@ -1266,6 +1286,7 @@ function assertSingleSuppressed(harness, reasonCode) {
   assert.equal(lifecycle.length, 1);
   assert.equal(lifecycle[0].data.event_type, "tracker_notification_suppressed");
   assert.deepEqual(lifecycle[0].data.metadata, {
+    completion_visibility: NOTIFICATION_REQUEST.completion_visibility,
     phase: "gate",
     reason_code: reasonCode
   });
@@ -1693,6 +1714,47 @@ test("popup session commands are idempotent and write paired start, stop, and ca
   );
 });
 
+test("session Start rejects stale window watcher before writing a marker", async () => {
+  const harness = createBackgroundHarness((call) => {
+    const response = successfulResponse();
+    if (call.method === "GET" && call.url.endsWith("/api/0/buckets/")) {
+      response.json = async () => ({
+        "aw-watcher-window_fixture": {
+          type: "currentwindow",
+          last_updated: "2026-07-29T23:00:00.000Z"
+        },
+        "aw-watcher-web_fixture": {
+          type: "web.tab.current",
+          last_updated: "2026-07-30T00:00:00.000Z"
+        }
+      });
+    }
+    return response;
+  });
+  await waitFor(
+    () => writtenEvents(harness).some(
+      (event) => event.data.event_type === "watcher_heartbeat"
+    ),
+    "startup heartbeat was not written"
+  );
+
+  const started = await sendRuntimeMessage(
+    harness,
+    { type: "START_STUDY_SESSION" },
+    EXTENSION_PAGE_SENDER
+  );
+  assert.equal(started.ok, false);
+  assert.equal(
+    started.error_code,
+    "activitywatch_window_watcher_not_ready"
+  );
+  assert.equal(writtenSessionEvents(harness).length, 0);
+  assert.deepEqual(
+    harness.storage.study_session_state_v1 || { status: "inactive" },
+    { status: "inactive" }
+  );
+});
+
 test("worker restart restores an active session without creating a duplicate marker", async () => {
   const first = createBackgroundHarness(() => successfulResponse());
   await waitFor(
@@ -1839,21 +1901,34 @@ test("rejected notification ingress writes only one safe background diagnostic",
   assert.equal(harness.notificationsCreated.length, 0);
 });
 
-test("foreground-observed completion is explicitly suppressed without creating a notification", async () => {
+test("foreground-observed completion creates one notification with explicit visibility", async () => {
   const harness = await readyHarness();
   const request = clone(NOTIFICATION_REQUEST);
   request.reason_code = "response_completed_while_foreground";
+  request.completion_visibility = "foreground";
   const response = await sendRuntimeMessage(
     harness,
     request,
     clone(TARGET_SENDER)
   );
-  assert.deepEqual(clone(response), {
-    created: false,
-    reason: "response_completed_while_foreground"
-  });
-  assert.equal(harness.notificationsCreated.length, 0);
-  assertSingleSuppressed(harness, "response_completed_while_foreground");
+  assert.equal(response.created, true);
+  assert.equal(harness.notificationsCreated.length, 1);
+  const lifecycle = notificationLifecycle(harness);
+  assert.deepEqual(
+    lifecycle.map((event) => event.data.event_type),
+    ["tracker_notification_attempted", "tracker_notification_created"]
+  );
+  assert.deepEqual(
+    lifecycle.map((event) => event.data.metadata.completion_visibility),
+    ["foreground", "foreground"]
+  );
+  assert.equal(
+    Object.hasOwn(
+      harness.storage.response_session_bindings_v1.authorizations,
+      "a".repeat(64)
+    ),
+    false
+  );
   assert.equal(
     Object.hasOwn(
       harness.storage.response_session_bindings_v1.authorizations,
@@ -1970,7 +2045,8 @@ test("real Claude hidden-completion adapter path reaches inactive suppressed aud
         namespace_fingerprint: "fixture-namespace-fingerprint"
       }
     },
-    reason_code: "response_completed_while_hidden"
+    reason_code: "response_completed_while_hidden",
+    completion_visibility: "background"
   };
   const state = {
     responseTurnCount: 1,
@@ -2057,7 +2133,8 @@ test("real Claude hidden-completion adapter path reaches inactive suppressed aud
   assert.ok(completed);
   assert.deepEqual(effects, [{
     type: "SHOW_TRACKER_NOTIFICATION",
-    reason_code: "response_completed_while_hidden"
+    reason_code: "response_completed_while_hidden",
+    completion_visibility: "background"
   }]);
 
   const harness = await readyInactiveHarness();
@@ -2189,8 +2266,16 @@ test("inactive suppresses notification creation with an audit while content-free
   assert.deepEqual(
     suppressed.map((event) => event.data.metadata),
     [
-      { phase: "gate", reason_code: "study_session_inactive" },
-      { phase: "gate", reason_code: "study_session_inactive" }
+      {
+        completion_visibility: "background",
+        phase: "gate",
+        reason_code: "study_session_inactive"
+      },
+      {
+        completion_visibility: "background",
+        phase: "gate",
+        reason_code: "study_session_inactive"
+      }
     ]
   );
   assert.equal(
@@ -2671,6 +2756,7 @@ test("notification remains before twenty seconds, then auto-clears and audits ex
   );
   assert.equal(autoCleared.length, 1);
   assert.deepEqual(clone(autoCleared[0].data.metadata), {
+    completion_visibility: "background",
     phase: "clear",
     reason_code: "notification_timeout",
     timeout_seconds: 20
@@ -2925,6 +3011,7 @@ test("notification permission denied fails before target storage or Chrome creat
     (event) => event.data.event_type === "tracker_notification_failed"
   );
   assert.deepEqual(clone(failed.data.metadata), {
+    completion_visibility: "background",
     error_code: "notification_permission_denied",
     phase: "permission"
   });
@@ -2973,6 +3060,7 @@ test("notification create failure is reduced to an allowlisted failed event and 
     (event) => event.data.event_type === "tracker_notification_failed"
   );
   assert.deepEqual(clone(failed.data.metadata), {
+    completion_visibility: "background",
     error_code: "notification_icon_load_failed",
     phase: "create"
   });
@@ -3037,6 +3125,7 @@ test("provisional conversation fails closed without creating or storing a root-U
     (event) => event.data.event_type === "tracker_notification_failed"
   );
   assert.deepEqual(clone(failed.data.metadata), {
+    completion_visibility: "background",
     error_code: "identity_not_exact",
     phase: "validate_context"
   });
@@ -3341,6 +3430,7 @@ for (const clickCase of CLICK_CASES) {
     );
     assert.deepEqual(clone(clicked.data.metadata), {
       action: clickCase.expectedAction,
+      completion_visibility: "background",
       focus_succeeded: clickCase.expectedFocus,
       phase: "focus"
     });
@@ -3399,6 +3489,7 @@ test("successful notification focus keeps clear API failure as a safe clear diag
   );
   assert.deepEqual(clone(clicked.data.metadata), {
     action: "activated_existing_tab",
+    completion_visibility: "background",
     focus_succeeded: true,
     phase: "focus"
   });
@@ -3482,6 +3573,7 @@ for (const lookupCase of TAB_LOOKUP_FAILURE_CASES) {
     );
     assert.deepEqual(clone(clicked.data.metadata), {
       action: "focus_failed",
+      completion_visibility: "background",
       focus_succeeded: false,
       phase: "focus"
     });
@@ -3618,6 +3710,7 @@ test("missing original tab uses prepare plus exact confirm and never opens a raw
   );
   assert.deepEqual(clone(clicked.data.metadata), {
     action: "reopened_via_native_actuator",
+    completion_visibility: "background",
     focus_succeeded: true,
     phase: "focus"
   });
@@ -3744,6 +3837,7 @@ for (const failureCase of POST_FOCUS_FAILURE_CASES) {
     );
     assert.deepEqual(clone(clicked.data.metadata), {
       action: "activated_existing_tab",
+      completion_visibility: "background",
       focus_succeeded: false,
       phase: "focus"
     });
@@ -3860,6 +3954,7 @@ test("failed notification focus retains the target only until its original deadl
   );
   assert.deepEqual(clone(clicked.data.metadata), {
     action: "activated_existing_tab",
+    completion_visibility: "background",
     focus_succeeded: false,
     phase: "focus"
   });

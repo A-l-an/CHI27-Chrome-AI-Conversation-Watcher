@@ -45,8 +45,15 @@ test("synthetic interaction trace covers input, submit dedupe, hidden completion
   ]);
   assert.deepEqual(allEffects, [{
     type: "SHOW_TRACKER_NOTIFICATION",
-    reason_code: "response_completed_while_hidden"
+    reason_code: "response_completed_while_hidden",
+    completion_visibility: "background"
   }]);
+  assert.equal(
+    allEvents.find(
+      (event) => event.event_type === "assistant_response_completed"
+    ).metadata.completion_visibility,
+    "background"
+  );
 });
 
 test("input_started fires only on each empty to non-empty transition", () => {
@@ -298,7 +305,7 @@ test("untagged terminal cannot close an active tagged lifecycle", () => {
   })), ["assistant_response_completed"]);
 });
 
-test("foreground-observed completion produces only an explicit suppressed audit effect", () => {
+test("foreground-observed completion requests one notification with explicit visibility", () => {
   const machine = new ConversationStateMachine();
   machine.dispatch({ type: "START", visible: true, at: 0 });
   machine.dispatch({
@@ -313,9 +320,11 @@ test("foreground-observed completion produces only an explicit suppressed audit 
     at: 3
   });
   assert.deepEqual(eventTypes(completed), ["assistant_response_completed"]);
+  assert.equal(completed.events[0].metadata.completion_visibility, "foreground");
   assert.deepEqual(completed.effects, [{
-    type: "AUDIT_TRACKER_NOTIFICATION_SUPPRESSED",
-    reason_code: "response_completed_while_foreground"
+    type: "SHOW_TRACKER_NOTIFICATION",
+    reason_code: "response_completed_while_foreground",
+    completion_visibility: "foreground"
   }]);
 });
 

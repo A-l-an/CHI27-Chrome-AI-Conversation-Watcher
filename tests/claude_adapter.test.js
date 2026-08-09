@@ -261,7 +261,8 @@ test("real-shaped Claude fixture deduplicates Enter/click submit and emits hidde
     );
     assert.deepEqual(effects, [{
       type: "SHOW_TRACKER_NOTIFICATION",
-      reason_code: "response_completed_while_hidden"
+      reason_code: "response_completed_while_hidden",
+      completion_visibility: "background"
     }]);
     assert.equal(
       actions.find((action) => action.type === "RESPONSE_COMPLETED")
@@ -365,7 +366,8 @@ test("Claude observer captures hidden data-is-streaming true-to-false completion
     );
     assert.deepEqual(effects, [{
       type: "SHOW_TRACKER_NOTIFICATION",
-      reason_code: "response_completed_while_hidden"
+      reason_code: "response_completed_while_hidden",
+      completion_visibility: "background"
     }]);
     assert.equal(observer.disconnected, false);
     adapter.stop();
@@ -426,7 +428,7 @@ test("Claude active marker without a submission does not emit response lifecycle
   }
 });
 
-test("Claude foreground completion records completion with only a suppressed audit effect", async () => {
+test("Claude foreground completion records completion with a SHOW notification effect", async () => {
   const fixture = createClaudeDomFixture();
   const originalDocument = global.document;
   global.document = fixture.document;
@@ -458,8 +460,9 @@ test("Claude foreground completion records completion with only a suppressed aud
       1
     );
     assert.deepEqual(effects, [{
-      type: "AUDIT_TRACKER_NOTIFICATION_SUPPRESSED",
-      reason_code: "response_completed_while_foreground"
+      type: "SHOW_TRACKER_NOTIFICATION",
+      reason_code: "response_completed_while_foreground",
+      completion_visibility: "foreground"
     }]);
   } finally {
     global.document = originalDocument;
