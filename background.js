@@ -41,6 +41,8 @@ const DIAGNOSTICS_KEY = "background_diagnostics_v1";
 const RETRY_ALARM = "flush-ai-conversation-events";
 const HEARTBEAT_ALARM = "write-ai-conversation-heartbeat";
 const STUDY_SESSION_WARNING_ALARM = "study-session-duration-warning";
+const CAPTURE_SOURCE_MAX_AGE_MS = 3 * 60 * 1000;
+const CAPTURE_SOURCE_FUTURE_TOLERANCE_MS = 30 * 1000;
 const AUTO_CLEAR_SECONDS = 20;
 const AUTO_CLEAR_MS = AUTO_CLEAR_SECONDS * 1000;
 const RESPONSE_BINDING_TTL_MS = 24 * 60 * 60 * 1000;
@@ -87,7 +89,7 @@ const LEGACY_QUEUE_EVENT_DATA_KEYS = new Set(
   Array.from(Core.EVENT_DATA_KEYS).filter((key) => key !== "turn_link_id")
 );
 const LEGACY_QUEUE_VALIDATION_LINK =
-  "00000000-0000-4000-8000-000000000000";
+  "00000000-0000-4000-" + "8000-000000000000";
 let ensuredBucketSignature = null;
 let ensuredSessionBucketSignature = null;
 let backgroundInitializationPromise = null;
@@ -676,6 +678,57 @@ async function verifySessionBucketReadable(config) {
   return { bucketId };
 }
 
+function hasFreshBucketType(buckets, expectedType, nowMs) {
+  if (!buckets || typeof buckets !== "object" || Array.isArray(buckets)) {
+    return false;
+  }
+  return Object.values(buckets).some((bucket) => {
+    if (
+      !bucket ||
+      typeof bucket !== "object" ||
+      Array.isArray(bucket) ||
+      bucket.type !== expectedType ||
+      typeof bucket.last_updated !== "string"
+    ) {
+      return false;
+    }
+    const updatedAt = Date.parse(bucket.last_updated);
+    const ageMs = nowMs - updatedAt;
+    return Number.isFinite(updatedAt) &&
+      ageMs >= -CAPTURE_SOURCE_FUTURE_TOLERANCE_MS &&
+      ageMs <= CAPTURE_SOURCE_MAX_AGE_MS;
+  });
+}
+
+async function verifyCaptureSourcesReady() {
+  const config = await loadConfig();
+  const baseUrl = validatedBaseUrl(config.aw_base_url);
+  const response = await fetchWithTimeout(
+    `${baseUrl}/api/0/buckets/`,
+    { method: "GET" }
+  );
+  if (!response.ok) {
+    throw makeDiagnosticError(
+      "activitywatch_capture_sources_http",
+      response.status
+    );
+  }
+  let buckets;
+  try {
+    buckets = await response.json();
+  } catch (_error) {
+    throw makeDiagnosticError("activitywatch_capture_sources_invalid");
+  }
+  const nowMs = Date.now();
+  if (!hasFreshBucketType(buckets, "currentwindow", nowMs)) {
+    throw makeDiagnosticError("activitywatch_window_watcher_not_ready");
+  }
+  if (!hasFreshBucketType(buckets, "web.tab.current", nowMs)) {
+    throw makeDiagnosticError("activitywatch_web_watcher_not_ready");
+  }
+  return true;
+}
+
 const queue = new ReliableEventQueue({
   store: queueStore,
   transport: sendEventsToActivityWatch,
@@ -721,6 +774,7 @@ const studySessionController = new StudySession.StudySessionController({
   store: studySessionStateStore,
   emitMarker: enqueueSessionMarker,
   pendingCount: sessionPendingCount,
+  preflight: verifyCaptureSourcesReady,
   randomUuid: Core.randomUuid
 });
 
@@ -1302,6 +1356,20 @@ function sanitizePersistedNotificationTarget(target) {
     ? rawLocatorHandle
     : null;
   const tabIdValid = isValidPersistedTabId(target.tab_id);
+  const expectedCompletionVisibility =
+    target.reason_code === "response_completed_while_hidden"
+      ? "background"
+      : target.reason_code === "response_completed_while_foreground"
+        ? "foreground"
+        : null;
+  const completionVisibility = target.completion_visibility ||
+    expectedCompletionVisibility;
+  if (
+    !expectedCompletionVisibility ||
+    completionVisibility !== expectedCompletionVisibility
+  ) {
+    return null;
+  }
   const result = {
     tab_id: tabIdValid ? target.tab_id : null,
     window_id: Number.isInteger(target.window_id) ? target.window_id : null,
@@ -1314,9 +1382,8 @@ function sanitizePersistedNotificationTarget(target) {
     target_status: namespaceValid && locatorHandle && tabIdValid
       ? "ready"
       : "unavailable",
-    reason_code: target.reason_code === "response_completed_while_hidden"
-      ? target.reason_code
-      : "response_completed_while_hidden",
+    reason_code: target.reason_code,
+    completion_visibility: completionVisibility,
     due_at: new Date(Date.parse(target.due_at)).toISOString()
   };
   if (namespaceValid) {
@@ -1468,14 +1535,19 @@ function notificationLifecycleEvent(target, eventType, metadata) {
       ? "exact"
       : "derived",
     source_adapter: "chrome-background-notification-v2",
-    metadata
+    metadata: Object.assign({}, metadata, {
+      completion_visibility: target.completion_visibility
+    })
   });
 }
 
 async function recordNotificationLifecycle(target, eventType, metadata, diagnosticCode) {
-  const details = Object.assign({ event_type: eventType }, metadata);
+  const lifecycleMetadata = Object.assign({}, metadata, {
+    completion_visibility: target.completion_visibility
+  });
+  const details = Object.assign({ event_type: eventType }, lifecycleMetadata);
   await recordDiagnostic(diagnosticCode, 0, null, details);
-  const event = notificationLifecycleEvent(target, eventType, metadata);
+  const event = notificationLifecycleEvent(target, eventType, lifecycleMetadata);
   return enqueueAndFlush([event]);
 }
 
@@ -1491,7 +1563,8 @@ async function suppressTrackerNotification(message, sender, reasonCode, response
       namespace_fingerprint: message.context.identity.namespace_fingerprint
     },
     locator_handle: message.context.identity.locator_handle,
-    reason_code: message.reason_code
+    reason_code: message.reason_code,
+    completion_visibility: message.completion_visibility
   };
   try {
     await recordNotificationLifecycle(
@@ -1540,16 +1613,6 @@ function exactOpaqueNotificationContext(provider, identity) {
 
 async function showTrackerNotification(message, sender) {
   const config = await loadConfig();
-  if (message.reason_code === "response_completed_while_foreground") {
-    await consumeResponseNotificationAuthorization(
-      message.context.identity.conversation_key
-    );
-    return suppressTrackerNotification(
-      message,
-      sender,
-      "response_completed_while_foreground"
-    );
-  }
   if (!config.notifications_enabled) {
     return suppressTrackerNotification(
       message,
@@ -1590,7 +1653,8 @@ async function showTrackerNotification(message, sender) {
       namespace_fingerprint: message.context.identity.namespace_fingerprint
     },
     locator_handle: message.context.identity.locator_handle,
-    reason_code: message.reason_code
+    reason_code: message.reason_code,
+    completion_visibility: message.completion_visibility
   };
   if (!exactOpaqueNotificationContext(
     message.provider,

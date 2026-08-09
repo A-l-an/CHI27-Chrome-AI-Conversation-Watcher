@@ -42,6 +42,7 @@ function fixture(options = {}) {
       markers.push(structuredClone(event));
     },
     pendingCount: options.pendingCount || (async () => 0),
+    preflight: options.preflight || (async () => {}),
     now: () => nowMs,
     randomUuid: () => ids[idIndex++],
     timeZone: () => "Asia/Shanghai",
@@ -113,6 +114,34 @@ test("duplicate start and stop clicks are idempotent", async () => {
   assert.equal(duplicateStop.changed, false);
   assert.equal(duplicateStop.reason, "not_active");
   assert.equal(harness.markers.length, 2);
+});
+
+test("failed source preflight creates neither state nor start marker", async () => {
+  let checks = 0;
+  const harness = fixture({
+    preflight: async () => {
+      checks += 1;
+      throw new Error("activitywatch_window_watcher_not_ready");
+    }
+  });
+  await assert.rejects(
+    harness.controller.start(),
+    /activitywatch_window_watcher_not_ready/
+  );
+  assert.equal(checks, 1);
+  assert.deepEqual(harness.store.snapshot(), { status: "inactive" });
+  assert.deepEqual(harness.markers, []);
+});
+
+test("duplicate active start does not rerun source preflight", async () => {
+  let checks = 0;
+  const harness = fixture({
+    preflight: async () => { checks += 1; }
+  });
+  await harness.controller.start();
+  const duplicate = await harness.controller.start();
+  assert.equal(duplicate.reason, "already_active");
+  assert.equal(checks, 1);
 });
 
 test("new controller instance restores active state without duplicating start marker", async () => {

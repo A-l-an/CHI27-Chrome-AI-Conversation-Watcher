@@ -204,6 +204,7 @@
       this.store = options.store;
       this.emitMarker = options.emitMarker;
       this.pendingCount = options.pendingCount || (async () => 0);
+      this.preflight = options.preflight || (async () => {});
       this.now = options.now || (() => Date.now());
       this.randomUuid = options.randomUuid;
       this.timeZone = options.timeZone || (() =>
@@ -261,6 +262,11 @@
             await this.describe(current)
           );
         }
+        // A completed session is exportable only when its mandatory
+        // ActivityWatch timeline sources were already live at Start. Run the
+        // gate before persisting state or emitting a marker, so a failed
+        // preflight cannot create a misleading experimental window.
+        await this.preflight();
         const nowMs = this.now();
         const occurredAt = new Date(nowMs).toISOString();
         const next = normalizeState({

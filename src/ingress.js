@@ -64,6 +64,7 @@
       "stop_control_disappeared",
       "stop_control_disappeared_after_settle"
     ]),
+    completion_visibility: new Set(["background", "foreground"]),
     generation_state: new Set([
       "response_in_progress_at_navigation",
       "response_observation_incomplete_at_new_submission"
@@ -326,6 +327,7 @@
       "provider",
       "context",
       "reason_code",
+      "completion_visibility",
       "notification_preview"
     ]);
     const allowedContextKeys = new Set(["identity"]);
@@ -349,7 +351,12 @@
       ![
         "response_completed_while_hidden",
         "response_completed_while_foreground"
-      ].includes(message.reason_code)
+      ].includes(message.reason_code) ||
+      message.completion_visibility !== (
+        message.reason_code === "response_completed_while_foreground"
+          ? "foreground"
+          : "background"
+      )
     ) {
       reject("notification_value_invalid");
     }
@@ -385,7 +392,8 @@
           namespace_fingerprint: data.namespace_fingerprint
         }
       },
-      reason_code: message.reason_code
+      reason_code: message.reason_code,
+      completion_visibility: message.completion_visibility
     };
     if (notificationPreview) {
       result.notification_preview = notificationPreview;

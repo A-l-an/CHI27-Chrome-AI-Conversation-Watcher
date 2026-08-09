@@ -168,6 +168,7 @@
           provider,
           identity: eventContext.identity,
           reason_code: effect.reason_code,
+          completion_visibility: effect.completion_visibility,
           notification_preview: opts.notification_preview
         });
         try {

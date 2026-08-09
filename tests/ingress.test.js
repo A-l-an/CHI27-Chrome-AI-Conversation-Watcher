@@ -78,6 +78,7 @@ function validClaudeCompletionEvent(completionSignal) {
     source_adapter: "claude-dom-v1",
     metadata: {
       completion_signal: completionSignal,
+      completion_visibility: "background",
       state_transition: "responding_to_completed"
     }
   });
@@ -159,6 +160,7 @@ test("ingress requires Claude completion to carry an explicit inactive-edge sign
   );
   assert.deepEqual(rebuilt.data.metadata, {
     completion_signal: completionSignal,
+    completion_visibility: "background",
     state_transition: "responding_to_completed"
   });
 
@@ -223,7 +225,8 @@ test("hidden Claude adapter completion survives state machine and ingress", asyn
     assert.equal(completedDescriptors.length, 1);
     assert.deepEqual(effects, [{
       type: "SHOW_TRACKER_NOTIFICATION",
-      reason_code: "response_completed_while_hidden"
+      reason_code: "response_completed_while_hidden",
+      completion_visibility: "background"
     }]);
     const descriptor = completedDescriptors[0];
     const occurredAt = new Date(descriptor.at).toISOString();
@@ -257,6 +260,7 @@ test("hidden Claude adapter completion survives state machine and ingress", asyn
     assert.deepEqual(rebuilt.data.metadata, {
       completion_signal:
         "response_active_marker_disappeared_after_settle",
+      completion_visibility: "background",
       state_transition: "responding_to_completed"
     });
   } finally {
@@ -349,6 +353,7 @@ test("notification request is sender-checked with one canonical ephemeral previe
       }
     },
     reason_code: "response_completed_while_hidden",
+    completion_visibility: "background",
     notification_preview: "这是一段已经清理并截断的回答预览。"
   };
   const sanitized = validateNotificationRequest(request, SENDER, EXTENSION_ID);
@@ -363,6 +368,17 @@ test("notification request is sender-checked with one canonical ephemeral previe
   assert.throws(
     () => validateNotificationRequest(malicious, SENDER, EXTENSION_ID),
     /notification_unknown_key/
+  );
+
+  const mismatchedVisibility = structuredClone(request);
+  mismatchedVisibility.completion_visibility = "foreground";
+  assert.throws(
+    () => validateNotificationRequest(
+      mismatchedVisibility,
+      SENDER,
+      EXTENSION_ID
+    ),
+    /notification_value_invalid/
   );
 
   for (const invalidPreview of [
@@ -412,7 +428,8 @@ test("real identity shape is projected to the closed notification ingress contra
       type: "SHOW_TRACKER_NOTIFICATION",
       provider: "chatgpt",
       context: { identity: internalIdentity },
-      reason_code: "response_completed_while_hidden"
+      reason_code: "response_completed_while_hidden",
+      completion_visibility: "background"
     }, SENDER, EXTENSION_ID),
     /notification_unknown_key/
   );
@@ -421,6 +438,7 @@ test("real identity shape is projected to the closed notification ingress contra
     provider: "chatgpt",
     identity: internalIdentity,
     reason_code: "response_completed_while_hidden",
+    completion_visibility: "background",
     notification_preview: "  已完成\n并可回访  "
   });
   assert.deepEqual(Object.keys(request.context.identity).sort(), [
@@ -431,6 +449,7 @@ test("real identity shape is projected to the closed notification ingress contra
     "namespace_generation"
   ]);
   assert.equal(request.context.identity.provider, undefined);
+  assert.equal(request.completion_visibility, "background");
   assert.equal(request.notification_preview, "已完成 并可回访");
   assert.doesNotThrow(
     () => validateNotificationRequest(request, SENDER, EXTENSION_ID)

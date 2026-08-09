@@ -207,6 +207,7 @@ SAFE_METADATA_ENUMS = {
         "stop_control_disappeared",
         "stop_control_disappeared_after_settle",
     },
+    "completion_visibility": {"background", "foreground"},
     "generation_state": {
         "response_in_progress_at_navigation",
         "response_observation_incomplete_at_new_submission",
